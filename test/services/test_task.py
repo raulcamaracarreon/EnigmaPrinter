@@ -653,6 +653,7 @@ class TestTaskService(unittest.TestCase):
             video_script="先城市，再地铁",
             amount=8,
             match_script_order=True,
+            visual_prompt_mode=False,
         )
 
     def test_start_stops_before_materials_when_term_provider_fails(self):
