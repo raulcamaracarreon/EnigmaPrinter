@@ -209,7 +209,9 @@ def similarity(a, b):
 def correct(subtitle_file, video_script):
     subtitle_items = file_to_subtitles(subtitle_file)
     normalized_script = utils.normalize_script_for_subtitle_matching(video_script)
-    script_lines = utils.split_string_by_punctuations(normalized_script)
+    script_lines = utils.split_string_by_punctuations(
+        normalized_script, keep_punctuation=True
+    )
 
     corrected = False
     new_subtitle_items = []

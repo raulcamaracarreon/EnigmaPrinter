@@ -1043,6 +1043,85 @@ def ensure_file_path_exists(file_path: str) -> None:
         os.makedirs(dir_path, exist_ok=True)
 
 
+_MPT_ALIGNMENT_ATTR = "_mpt_alignment_units"
+
+
+def ensure_mpt_alignment_fields(sub_maker: SubMaker) -> SubMaker:
+    """Attach a provider-neutral fine-alignment buffer to a SubMaker.
+
+    MoneyPrinterTurbo historically treated ``SubMaker`` as a subtitle container.
+    For audio-first planning we also need to preserve the raw native word timing
+    before any subtitle aggregation can coarsen it.  This extra attribute is
+    intentionally private and ignored by the legacy subtitle/video pipeline.
+    """
+    if not hasattr(sub_maker, _MPT_ALIGNMENT_ATTR):
+        try:
+            setattr(sub_maker, _MPT_ALIGNMENT_ATTR, [])
+        except Exception:
+            # Extremely old/custom SubMaker implementations may disallow dynamic
+            # attributes. In that case the existing cues/offset paths remain the
+            # fallback and legacy behavior is unchanged.
+            pass
+    return sub_maker
+
+
+def _append_mpt_alignment_unit(
+    sub_maker: SubMaker, *, text: str, start_seconds: float, end_seconds: float
+) -> None:
+    units = getattr(sub_maker, _MPT_ALIGNMENT_ATTR, None)
+    if not isinstance(units, list):
+        return
+    cleaned_text = unescape(str(text or "")).strip()
+    try:
+        start = float(start_seconds)
+        end = float(end_seconds)
+    except (TypeError, ValueError, OverflowError):
+        return
+    if not cleaned_text or not math.isfinite(start) or not math.isfinite(end):
+        return
+    start = max(0.0, start)
+    end = max(start, end)
+    units.append({"start": start, "end": end, "text": cleaned_text})
+
+
+def _capture_edge_word_alignment_after_feed(
+    sub_maker: SubMaker, *, cue_count_before: int, offset_count_before: int
+) -> None:
+    """Capture the newest Edge WordBoundary after SubMaker.feed().
+
+    Reading the normalized SubMaker result avoids depending on undocumented raw
+    Edge event units. edge_tts 7.x exposes ``cues`` with timedeltas; older
+    compatibility builds may instead populate legacy ``subs/offset`` in 100-ns
+    units.
+    """
+    cues = list(getattr(sub_maker, "cues", []) or [])
+    if len(cues) > cue_count_before:
+        cue = cues[-1]
+        try:
+            start = cue.start.total_seconds()
+            end = cue.end.total_seconds()
+        except Exception:
+            start = end = None
+        if start is not None and end is not None:
+            _append_mpt_alignment_unit(
+                sub_maker, text=getattr(cue, "content", ""), start_seconds=start, end_seconds=end
+            )
+            return
+
+    offsets = list(getattr(sub_maker, "offset", []) or [])
+    subs = list(getattr(sub_maker, "subs", []) or [])
+    if len(offsets) > offset_count_before and subs:
+        try:
+            start_100ns, end_100ns = offsets[-1]
+            start = float(start_100ns) / 10_000_000.0
+            end = float(end_100ns) / 10_000_000.0
+        except (TypeError, ValueError, OverflowError):
+            return
+        _append_mpt_alignment_unit(
+            sub_maker, text=subs[-1], start_seconds=start, end_seconds=end
+        )
+
+
 def ensure_legacy_submaker_fields(sub_maker: SubMaker) -> SubMaker:
     """
     为项目里仍然沿用旧字幕结构的调用方补齐兼容字段。
@@ -1302,7 +1381,7 @@ def azure_tts_v1(
             # 2. 旧版不支持 `boundary`，且通常只暴露异步 `stream()`
             ensure_file_path_exists(voice_file)
             communicate = create_edge_tts_communicate(text, voice_name, rate_str)
-            sub_maker = edge_tts.SubMaker()
+            sub_maker = ensure_mpt_alignment_fields(edge_tts.SubMaker())
             timeout_seconds = get_edge_tts_timeout_seconds()
 
             with open(voice_file, "wb") as file:
@@ -1314,7 +1393,18 @@ def azure_tts_v1(
                         # 无论来自 7.x 的同步流，还是旧版异步流，只要事件结构
                         # 里仍有边界信息，就统一喂给 SubMaker，保证后续字幕链路
                         # 仍然走项目现有逻辑。
+                        cue_count_before = len(getattr(sub_maker, "cues", []) or [])
+                        offset_count_before = len(getattr(sub_maker, "offset", []) or [])
                         sub_maker.feed(chunk)
+                        # Preserve raw word timing separately for audio-first media
+                        # planning. Sentence boundaries remain useful to SubMaker but
+                        # are not treated as fine word-alignment units.
+                        if chunk_type == "WordBoundary":
+                            _capture_edge_word_alignment_after_feed(
+                                sub_maker,
+                                cue_count_before=cue_count_before,
+                                offset_count_before=offset_count_before,
+                            )
 
                 stream_edge_tts_chunks(
                     communicate, _handle_chunk, timeout_seconds=timeout_seconds
@@ -1495,7 +1585,9 @@ def azure_tts_v2(
 
             import azure.cognitiveservices.speech as speechsdk
 
-            sub_maker = ensure_legacy_submaker_fields(SubMaker())
+            sub_maker = ensure_mpt_alignment_fields(
+                ensure_legacy_submaker_fields(SubMaker())
+            )
 
             def speech_synthesizer_word_boundary_cb(evt: speechsdk.SessionEventArgs):
                 # print('WordBoundary event:')
@@ -1510,6 +1602,12 @@ def azure_tts_v2(
                 offset = _format_duration_to_offset(evt.audio_offset)
                 sub_maker.subs.append(evt.text)
                 sub_maker.offset.append((offset, offset + duration))
+                _append_mpt_alignment_unit(
+                    sub_maker,
+                    text=evt.text,
+                    start_seconds=offset / 10_000_000.0,
+                    end_seconds=(offset + duration) / 10_000_000.0,
+                )
 
             # Creates an instance of a speech config with specified subscription key and service region.
             speech_key = config.azure.get("speech_key", "")
@@ -2703,6 +2801,49 @@ def _match_script_line(script_lines: list[str], current_text: str, sub_index: in
     return ""
 
 
+def _merge_punctuation_only_script_lines(script_lines: list[str]) -> list[str]:
+    """Merge punctuation-only fragments back into neighboring subtitle lines.
+
+    ``split_string_by_punctuations(..., keep_punctuation=True)`` intentionally
+    preserves closing punctuation for display. Quotes that come *after* a terminal
+    period can therefore become a standalone item (for example ``”`` after
+    ``“Contesta.``). Edge TTS has no timing cue for that quote by itself, so a
+    strict one-line-per-item matcher would stall at the punctuation-only fragment
+    and reject every later subtitle.
+
+    Keep the visible punctuation, but attach punctuation-only fragments to the
+    previous textual line before cue aggregation. A leading punctuation fragment
+    is held and prepended to the next textual line.
+    """
+    merged: list[str] = []
+    leading = ""
+
+    for raw_line in script_lines or []:
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+
+        has_textual_content = any(ch.isalnum() for ch in line)
+        if not has_textual_content:
+            if merged:
+                merged[-1] = f"{merged[-1]}{line}"
+            else:
+                leading += line
+            continue
+
+        if leading:
+            line = f"{leading}{line}"
+            leading = ""
+        merged.append(line)
+
+    if leading and merged:
+        merged[-1] = f"{merged[-1]}{leading}"
+    elif leading:
+        merged.append(leading)
+
+    return merged
+
+
 def _write_subtitle_items(sub_items: list[str], subtitle_file: str) -> bool:
     """
     将已经聚合好的字幕段写入到 SRT 文件，并做一次基本可读性验证。
@@ -2906,7 +3047,11 @@ def create_subtitle(
                 _write_subtitle_items(sub_items, subtitle_file)
                 return
 
-        script_lines = utils.split_string_by_punctuations(text)
+        script_lines = _merge_punctuation_only_script_lines(
+            utils.split_string_by_punctuations(
+                text, keep_punctuation=True
+            )
+        )
         if hasattr(sub_maker, "cues") and sub_maker.cues:
             sub_items = _build_subtitle_items_from_edge_cues(sub_maker, script_lines)
         else:

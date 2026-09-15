@@ -50,6 +50,12 @@ from app.services import (
     loomloom,
     material,
     metaso_minimax,
+    narration_timeline,
+    visual_timeline,
+    media_shot_plan,
+    media_shot_refinement,
+    visual_shot_planner,
+    timeline_media,
     ofox,
     video,
     volcengine_seedance,
@@ -109,10 +115,109 @@ VOICE_MODE_TTS = "tts"
 VOICE_MODE_UPLOAD = "upload"
 VOICE_MODE_NONE = "none"
 LOOMLOOM_MAX_POLL_FAILURES = 5
-# WebUI 按素材能力分组展示视频来源，但底层仍保存原有 video_source 值。
-# AI 视频组与设置页共用同一业务顺序：合作服务商优先，并按秘塔、OFox、
-# 胜算云、火山引擎排列；其余服务随后展示。这样两个入口的顺序一致，同时
-# 不改变 config.toml、历史任务和 API 请求中的字段语义，旧用户无需迁移配置。
+MEDIA_SOURCE_MODE_SINGLE = "single"
+MEDIA_SOURCE_MODE_HYBRID = "hybrid"
+MEDIA_PLANNING_AUTOMATIC = "automatic"
+MEDIA_PLANNING_MANUAL = "manual"
+PLANNED_MEDIA_TYPE_IMAGE = "image"
+PLANNED_MEDIA_TYPE_VIDEO = "video"
+PLANNED_MEDIA_MOTION_NONE = ""
+MEDIA_PLANNER_NUMBER_WORDS_PATTERN = (
+    r"zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+    r"eighteen|nineteen|twenty|"
+    r"cero|uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|"
+    r"diez|once|doce|trece|catorce|quince|dieciseis|dieciséis|"
+    r"diecisiete|dieciocho|diecinueve|veinte"
+)
+
+MEDIA_PLANNER_EXACT_VALUE_PATTERN = re.compile(
+    rf"\b\d{{1,2}}:\d{{2}}\b|"
+    rf"\b\d+\b|"
+    rf"\b(?:{MEDIA_PLANNER_NUMBER_WORDS_PATTERN})\b",
+    re.IGNORECASE,
+)
+
+MEDIA_PLANNER_STRONG_DISPLAY_PATTERN = re.compile(
+    r"\b(?:"
+    r"indicator|indicador|"
+    r"display|screen|pantalla|"
+    r"numeral|"
+    r"numbered\s+buttons?|"
+    r"button\s+panel|"
+    r"panel\s+de\s+botones|"
+    r"botones?\s+numerados?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+MEDIA_PLANNER_CLOCK_PATTERN = re.compile(
+    r"\b(?:clock|watch|reloj)\b",
+    re.IGNORECASE,
+)
+
+MEDIA_PLANNER_DISPLAY_VERB_PATTERN = re.compile(
+    r"\b(?:"
+    r"shows?|reads?|displays?|indicates?|marks?|"
+    r"marca|muestra|indica|dice"
+    r")\b",
+    re.IGNORECASE,
+)
+
+MEDIA_PLANNER_TEXT_OBJECT_PATTERN = re.compile(
+    r"\b(?:label|tag|etiqueta|sign|letrero)\b",
+    re.IGNORECASE,
+)
+
+MEDIA_PLANNER_WRITING_PATTERN = re.compile(
+    r"\b(?:"
+    r"written|handwritten|"
+    r"escrito|escrita|manuscrito|manuscrita|"
+    r"reads?|says?|dice"
+    r")\b",
+    re.IGNORECASE,
+)
+
+MEDIA_PLANNER_MOTION_KEYWORDS = (
+    "walk", "walks", "walking",
+    "run", "runs", "running",
+    "open", "opens", "opening",
+    "close", "closes", "closing",
+    "press", "presses", "pressing",
+    "push", "pushes", "pushing",
+    "lift", "lifts", "lifting",
+    "raise", "raises", "raising",
+    "turn", "turns", "turning",
+    "look up", "looks up", "looking up",
+    "approach", "approaches", "approaching",
+    "enter", "enters", "entering",
+    "exit", "exits", "leaving",
+    "fall", "falls", "falling",
+    "jolt", "jolts",
+    "jerk", "jerks",
+    "climb", "climbs", "climbing",
+    "descend", "descends", "descending",
+    "stop", "stops", "stopping",
+    "grab", "grabs", "grabbing",
+    "reach", "reaches", "reaching",
+    "step", "steps", "stepping",
+
+    "camina", "caminando", "caminar",
+    "corre", "corriendo", "correr",
+    "abre", "abriendo", "abrir",
+    "cierra", "cerrando", "cerrar",
+    "presiona", "presionando", "presionar",
+    "empuja", "empujando", "empujar",
+    "levanta", "levantando", "levantar",
+    "gira", "girando", "girar",
+    "se acerca", "acercándose",
+    "entra", "entrando", "entrar",
+    "sale", "saliendo", "salir",
+    "cae", "cayendo", "caer",
+    "desciende", "descendiendo",
+    "se detiene",
+    "agarra", "sujeta",
+)
 VIDEO_SOURCE_GROUPS = {
     "stock_video": ("pexels", "pixabay", "coverr"),
     "ai_video": (
@@ -121,8 +226,9 @@ VIDEO_SOURCE_GROUPS = {
         "loomloom",
         "volcengine_seedance",
         "wavespeed",
+        "comfyui_video",
     ),
-    "ai_image": ("openai_image",),
+    "ai_image": ("openai_image", "comfyui_t2i"),
     "local": ("local",),
 }
 # Upload-Post 的 API Key 与发布用户分别在两个页面管理，并且发布用户名称
@@ -1443,12 +1549,21 @@ def _apply_restored_params(params):
     """
     video_terms = params.get("video_terms") or ""
     if isinstance(video_terms, list):
-        video_terms = ", ".join(str(term) for term in video_terms)
+        video_terms = "\n".join(str(term) for term in video_terms)
 
     # 文案与高级脚本设置。
     st.session_state["video_subject"] = params.get("video_subject") or ""
     st.session_state["video_script"] = params.get("video_script") or ""
     st.session_state["video_terms"] = str(video_terms)
+    st.session_state["comfyui_video_subject_anchors"] = (
+        params.get("comfyui_video_subject_anchors") or ""
+    )
+    # Older ComfyUI Video tasks only stored video_terms. Use those as the initial
+    # Scene Prompts on restore so the new fields remain backward compatible.
+    restored_scene_prompts = params.get("comfyui_video_scene_prompts") or ""
+    if not restored_scene_prompts and (params.get("video_source") == "comfyui_video"):
+        restored_scene_prompts = str(video_terms)
+    st.session_state["comfyui_video_scene_prompts"] = restored_scene_prompts
     _set_stable_widget_value(
         "script_language_select", params.get("video_language") or ""
     )
@@ -1460,6 +1575,19 @@ def _apply_restored_params(params):
 
     # 视频设置。素材上传控件不能由服务端写入，因此本地素材需要用户重新选择。
     video_source = params.get("video_source") or "pexels"
+    if video_source == "comfyui_mage":
+        video_source = "comfyui_t2i"
+    restored_media_source_mode = str(params.get("media_source_mode") or "").strip()
+    if restored_media_source_mode not in {MEDIA_SOURCE_MODE_SINGLE, MEDIA_SOURCE_MODE_HYBRID}:
+        # Tasks created by the first hybrid implementation did not yet persist an
+        # explicit source mode. Preserve those tasks when both hybrid artifacts exist;
+        # every other historical task remains a normal single-source task.
+        restored_media_source_mode = (
+            MEDIA_SOURCE_MODE_HYBRID
+            if params.get("media_plan") and params.get("media_shot_timeline")
+            else MEDIA_SOURCE_MODE_SINGLE
+        )
+    _set_stable_widget_value("media_source_mode_control", restored_media_source_mode)
     _set_stable_widget_value("video_source_select", video_source)
     _set_stable_widget_value(
         "video_concat_mode_select", params.get("video_concat_mode") or "random"
@@ -1468,8 +1596,11 @@ def _apply_restored_params(params):
         "video_transition_mode_select",
         params.get("video_transition_mode") or VideoTransitionMode.none.value,
     )
+    aspect_widget_source = (
+        "hybrid" if restored_media_source_mode == MEDIA_SOURCE_MODE_HYBRID else video_source
+    )
     _set_stable_widget_value(
-        f"video_aspect_for_{video_source}",
+        f"video_aspect_for_{aspect_widget_source}",
         params.get("video_aspect") or VideoAspect.portrait.value,
     )
     _set_stable_widget_value(
@@ -1487,6 +1618,21 @@ def _apply_restored_params(params):
         utils.normalize_clip_speed(params.get("video_clip_speed", 1.0)),
     )
     _set_stable_widget_value("video_count_select", params.get("video_count", 1))
+    _set_stable_widget_value(
+        "default_ai_image_provider_select",
+        params.get("default_ai_image_provider")
+        or str(config.ui.get("default_ai_image_provider", "comfyui_t2i") or "comfyui_t2i"),
+    )
+    _set_stable_widget_value(
+        "default_ai_video_provider_select",
+        params.get("default_ai_video_provider")
+        or str(config.ui.get("default_ai_video_provider", "comfyui_video") or "comfyui_video"),
+    )
+    _set_stable_widget_value(
+        "media_planning_mode_control",
+        params.get("media_planning_mode")
+        or str(config.ui.get("media_planning_mode", MEDIA_PLANNING_AUTOMATIC) or MEDIA_PLANNING_AUTOMATIC),
+    )
     st.session_state["match_materials_to_script"] = bool(
         params.get("match_materials_to_script", False)
     )
@@ -2519,6 +2665,403 @@ def stable_segmented_control(
         format_func=format_func or str,
         key=widget_key,
         **kwargs,
+    )
+
+
+def _media_planner_provider_labels() -> dict[str, str]:
+    return {
+        "openai_image": tr("OpenAI Compatible Text-to-Image"),
+        "comfyui_t2i": tr("ComfyUI T2I (Local)"),
+        "comfyui_video": tr("ComfyUI Video (Local)"),
+    }
+
+
+def _media_planner_image_provider_options() -> list[str]:
+    return ["comfyui_t2i", "openai_image"]
+
+
+def _media_planner_video_provider_options() -> list[str]:
+    return ["comfyui_video"]
+
+
+def _normalize_media_planner_provider(provider: str | None, options: list[str], fallback: str) -> str:
+    candidate = str(provider or "").strip()
+    return candidate if candidate in options else fallback
+
+
+def _current_still_image_motion_choice() -> str:
+    return video.normalize_still_image_motion(
+        config.ui.get("still_image_motion", video.STILL_IMAGE_MOTION_ZOOM_IN)
+    )
+
+
+def _shot_requires_exact_text(narration_text: str, visual_prompt: str) -> bool:
+    def source_requires_exact_text(text: str) -> bool:
+        text = str(text or "")
+
+        exact_time = re.search(
+            r"\b\d{1,2}:\d{2}\b",
+            text,
+            re.IGNORECASE,
+        )
+
+        if exact_time and (
+            MEDIA_PLANNER_CLOCK_PATTERN.search(text)
+            or MEDIA_PLANNER_DISPLAY_VERB_PATTERN.search(text)
+        ):
+            return True
+
+        if (
+            MEDIA_PLANNER_STRONG_DISPLAY_PATTERN.search(text)
+            and MEDIA_PLANNER_EXACT_VALUE_PATTERN.search(text)
+        ):
+            return True
+
+        if (
+            MEDIA_PLANNER_CLOCK_PATTERN.search(text)
+            and MEDIA_PLANNER_DISPLAY_VERB_PATTERN.search(text)
+            and MEDIA_PLANNER_EXACT_VALUE_PATTERN.search(text)
+        ):
+            return True
+
+        if (
+            MEDIA_PLANNER_TEXT_OBJECT_PATTERN.search(text)
+            and MEDIA_PLANNER_WRITING_PATTERN.search(text)
+        ):
+            return True
+
+        return False
+
+    return (
+        source_requires_exact_text(narration_text)
+        or source_requires_exact_text(visual_prompt)
+    )
+
+
+def _shot_implies_motion(narration_text: str, visual_prompt: str) -> bool:
+    combined = f"{narration_text or ''} {visual_prompt or ''}".lower()
+
+    # Camera/composition language is not subject movement.
+    combined = re.sub(
+        r"\b(?:extreme\s+)?close[- ]up\b",
+        " ",
+        combined,
+    )
+
+    combined = re.sub(
+        r"\bclose\s+(?:view|shot|framing|portrait)\b",
+        " ",
+        combined,
+    )
+
+    combined = re.sub(
+        r"(?<!\w)close\s*,",
+        " ",
+        combined,
+    )
+
+    # Descriptions such as "buttons run from 11 to 14" describe an arrangement,
+    # not physical movement.
+    combined = re.sub(
+        r"\b(?:numbered\s+)?buttons?\s+run(?:s)?\s+from\b",
+        " ",
+        combined,
+    )
+
+    return any(
+        re.search(
+            rf"(?<!\w){re.escape(keyword)}(?!\w)",
+            combined,
+        )
+        for keyword in MEDIA_PLANNER_MOTION_KEYWORDS
+    )
+
+def _build_automatic_media_plan(
+    visual_shots: list[dict],
+    *,
+    default_image_provider: str,
+    default_video_provider: str,
+    still_image_motion: str,
+) -> list[dict]:
+    image_provider = _normalize_media_planner_provider(
+        default_image_provider,
+        _media_planner_image_provider_options(),
+        "comfyui_t2i",
+    )
+    video_provider = _normalize_media_planner_provider(
+        default_video_provider,
+        _media_planner_video_provider_options(),
+        "comfyui_video",
+    )
+    rows: list[dict] = []
+    for position, shot in enumerate(list(visual_shots or []), start=1):
+        try:
+            start = float(shot.get("start", 0.0))
+            end = float(shot.get("end", start))
+        except (TypeError, ValueError, OverflowError):
+            start = 0.0
+            end = start
+        duration = max(0.0, end - start)
+        narration_text = str(shot.get("narration_text", "") or "").strip()
+        visual_prompt = str(shot.get("visual_prompt", "") or "").strip()
+        if _shot_requires_exact_text(narration_text, visual_prompt):
+            resource_type = PLANNED_MEDIA_TYPE_IMAGE
+            provider = "openai_image"
+            motion = still_image_motion
+            auto_rule = "text-sensitive"
+        elif duration < 3.0:
+            resource_type = PLANNED_MEDIA_TYPE_IMAGE
+            provider = image_provider
+            motion = still_image_motion
+            auto_rule = "short-shot"
+        elif _shot_implies_motion(narration_text, visual_prompt):
+            resource_type = PLANNED_MEDIA_TYPE_VIDEO
+            provider = video_provider
+            motion = PLANNED_MEDIA_MOTION_NONE
+            auto_rule = "movement"
+        else:
+            resource_type = PLANNED_MEDIA_TYPE_IMAGE
+            provider = image_provider
+            motion = still_image_motion
+            auto_rule = "default-image"
+        rows.append(
+            {
+                "shot_index": int(shot.get("index", position) or position),
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "duration": round(duration, 3),
+                "narration_text": narration_text,
+                "visual_prompt": visual_prompt,
+                "resource_type": resource_type,
+                "provider": provider,
+                "motion": motion,
+                "auto_rule": auto_rule,
+            }
+        )
+    return rows
+
+
+def _summarize_media_plan_rows(rows: list[dict]) -> str:
+    image_count = sum(1 for row in rows if row.get("resource_type") == PLANNED_MEDIA_TYPE_IMAGE)
+    video_count = sum(1 for row in rows if row.get("resource_type") == PLANNED_MEDIA_TYPE_VIDEO)
+    openai_count = sum(1 for row in rows if row.get("provider") == "openai_image")
+    comfyui_image_count = sum(1 for row in rows if row.get("provider") == "comfyui_t2i")
+    comfyui_video_count = sum(1 for row in rows if row.get("provider") == "comfyui_video")
+    parts = [
+        tr("Images: {count}").format(count=image_count),
+        tr("Videos: {count}").format(count=video_count),
+    ]
+    provider_parts = []
+    if comfyui_image_count:
+        provider_parts.append(f"{_media_planner_provider_labels()['comfyui_t2i']}: {comfyui_image_count}")
+    if openai_count:
+        provider_parts.append(f"{_media_planner_provider_labels()['openai_image']}: {openai_count}")
+    if comfyui_video_count:
+        provider_parts.append(f"{_media_planner_provider_labels()['comfyui_video']}: {comfyui_video_count}")
+    if provider_parts:
+        parts.append(" · ".join(provider_parts))
+    return " | ".join(parts)
+
+
+def _render_media_planner(visual_shots: list[dict], visual_plan_fingerprint: str, params) -> None:
+    if not visual_shots:
+        return
+    if (
+        str(getattr(params, "media_source_mode", MEDIA_SOURCE_MODE_SINGLE) or "")
+        != MEDIA_SOURCE_MODE_HYBRID
+    ):
+        params.media_plan = None
+        return
+
+    planner_state_key = "media_plan_preview"
+    default_image_provider = _normalize_media_planner_provider(
+        getattr(params, "default_ai_image_provider", None),
+        _media_planner_image_provider_options(),
+        "comfyui_t2i",
+    )
+    default_video_provider = _normalize_media_planner_provider(
+        getattr(params, "default_ai_video_provider", None),
+        _media_planner_video_provider_options(),
+        "comfyui_video",
+    )
+    still_image_motion = _current_still_image_motion_choice()
+    automatic_rows = _build_automatic_media_plan(
+        visual_shots,
+        default_image_provider=default_image_provider,
+        default_video_provider=default_video_provider,
+        still_image_motion=still_image_motion,
+    )
+
+    current_state = st.session_state.get(planner_state_key)
+    if (
+        not isinstance(current_state, dict)
+        or current_state.get("fingerprint") != visual_plan_fingerprint
+        or not isinstance(current_state.get("rows"), list)
+    ):
+        st.session_state[planner_state_key] = {
+            "fingerprint": visual_plan_fingerprint,
+            "rows": [dict(row) for row in automatic_rows],
+        }
+    elif not current_state.get("rows"):
+        current_state["rows"] = [dict(row) for row in automatic_rows]
+
+    planner_mode_options = [MEDIA_PLANNING_AUTOMATIC, MEDIA_PLANNING_MANUAL]
+    planner_mode_labels = {
+        MEDIA_PLANNING_AUTOMATIC: tr("Automatic"),
+        MEDIA_PLANNING_MANUAL: tr("Manual"),
+    }
+    planner_mode = stable_segmented_control(
+        tr("Hybrid Media Planning"),
+        options=planner_mode_options,
+        default_value=_saved_ui_choice(
+            "media_planning_mode",
+            planner_mode_options,
+            MEDIA_PLANNING_AUTOMATIC,
+        ),
+        key="media_planning_mode_control",
+        format_func=lambda value: planner_mode_labels[value],
+        width="stretch",
+    )
+    _set_runtime_config("ui", "media_planning_mode", planner_mode)
+    params.media_planning_mode = planner_mode
+
+    if st.button(
+        tr("Rebuild Hybrid Media Plan"),
+        key=f"rebuild_media_plan_{visual_plan_fingerprint}",
+        use_container_width=True,
+        help=tr(
+            "Apply the current hybrid planning rules again using the applied Visual Prompts, the current still-image motion preference, and the default AI providers."
+        ),
+    ):
+        st.session_state[planner_state_key] = {
+            "fingerprint": visual_plan_fingerprint,
+            "rows": [dict(row) for row in automatic_rows],
+        }
+
+    state_rows = st.session_state[planner_state_key]["rows"]
+    st.caption(
+        tr(
+            "Automatic planning uses your default AI image/video providers, forces OpenAI Image for text-sensitive shots, prefers still images for shots shorter than 3 seconds, and prefers AI video when the shot prompt implies motion."
+        )
+    )
+    st.caption(_summarize_media_plan_rows(list(state_rows)))
+
+    provider_labels = _media_planner_provider_labels()
+    motion_labels = {
+        video.STILL_IMAGE_MOTION_STATIC: tr("Static"),
+        video.STILL_IMAGE_MOTION_ZOOM_IN: tr("Slow Zoom In"),
+    }
+
+    use_media_plan = True
+    st.caption(
+        tr(
+            "Hybrid Media Planning is active: Generate Video will dispatch each locked shot to the provider shown below."
+        )
+    )
+
+    if planner_mode == MEDIA_PLANNING_AUTOMATIC:
+        preview_rows = []
+        for row in list(state_rows):
+            preview_rows.append(
+                {
+                    "#": row.get("shot_index"),
+                    tr("Start"): row.get("start"),
+                    tr("End"): row.get("end"),
+                    tr("Duration"): row.get("duration"),
+                    tr("Type"): tr("Image") if row.get("resource_type") == PLANNED_MEDIA_TYPE_IMAGE else tr("Video"),
+                    tr("Provider"): provider_labels.get(str(row.get("provider", "")), str(row.get("provider", ""))),
+                    tr("Motion"): motion_labels.get(str(row.get("motion", "")), "—") if row.get("resource_type") == PLANNED_MEDIA_TYPE_IMAGE else "—",
+                    tr("Rule"): str(row.get("auto_rule", "")),
+                    tr("Visual Prompt"): row.get("visual_prompt", ""),
+                }
+            )
+        st.dataframe(preview_rows, hide_index=True, use_container_width=True)
+        params.media_plan = (
+            [dict(row) for row in state_rows] if use_media_plan else None
+        )
+        return
+
+    edited_rows: list[dict] = []
+    for row in list(state_rows):
+        shot_index = int(row.get("shot_index", len(edited_rows) + 1) or len(edited_rows) + 1)
+        with st.container(border=True):
+            summary_cols = st.columns([0.8, 1, 1, 1, 1.2])
+            summary_cols[0].markdown(f"**#{shot_index}**")
+            summary_cols[1].caption(f"{tr('Start')}: {row.get('start', 0.0)}")
+            summary_cols[2].caption(f"{tr('End')}: {row.get('end', 0.0)}")
+            summary_cols[3].caption(f"{tr('Duration')}: {row.get('duration', 0.0)}")
+            summary_cols[4].caption(f"{tr('Rule')}: {row.get('auto_rule', '')}")
+            if row.get("narration_text"):
+                st.caption(f"**{tr('Narration Text')}:** {row.get('narration_text', '')}")
+            st.caption(f"**{tr('Visual Prompt')}:** {row.get('visual_prompt', '')}")
+
+            type_options = [PLANNED_MEDIA_TYPE_IMAGE, PLANNED_MEDIA_TYPE_VIDEO]
+            type_labels = {
+                PLANNED_MEDIA_TYPE_IMAGE: tr("Image"),
+                PLANNED_MEDIA_TYPE_VIDEO: tr("Video"),
+            }
+            selected_type = stable_selectbox(
+                tr("Resource Type"),
+                options=type_options,
+                default_value=(
+                    row.get("resource_type")
+                    if row.get("resource_type") in type_options
+                    else PLANNED_MEDIA_TYPE_IMAGE
+                ),
+                key=f"media_plan_type_{visual_plan_fingerprint}_{shot_index}",
+                format_func=lambda value: type_labels[value],
+            )
+            if selected_type == PLANNED_MEDIA_TYPE_IMAGE:
+                provider_options = _media_planner_image_provider_options()
+                provider_default = row.get("provider")
+                if provider_default not in provider_options:
+                    provider_default = default_image_provider
+            else:
+                provider_options = _media_planner_video_provider_options()
+                provider_default = row.get("provider")
+                if provider_default not in provider_options:
+                    provider_default = default_video_provider
+            selected_provider = stable_selectbox(
+                tr("Provider"),
+                options=provider_options,
+                default_value=provider_default,
+                key=f"media_plan_provider_{visual_plan_fingerprint}_{shot_index}",
+                format_func=lambda value: provider_labels.get(value, value),
+            )
+            if selected_type == PLANNED_MEDIA_TYPE_IMAGE:
+                selected_motion = stable_selectbox(
+                    tr("Still Image Motion"),
+                    options=[
+                        video.STILL_IMAGE_MOTION_STATIC,
+                        video.STILL_IMAGE_MOTION_ZOOM_IN,
+                    ],
+                    default_value=(
+                        row.get("motion")
+                        if row.get("motion") in motion_labels
+                        else still_image_motion
+                    ),
+                    key=f"media_plan_motion_{visual_plan_fingerprint}_{shot_index}",
+                    format_func=lambda value: motion_labels.get(value, value),
+                )
+            else:
+                selected_motion = PLANNED_MEDIA_MOTION_NONE
+                st.caption(tr("Motion is only used for image-based shots."))
+
+            edited_rows.append(
+                {
+                    **dict(row),
+                    "resource_type": selected_type,
+                    "provider": selected_provider,
+                    "motion": selected_motion,
+                }
+            )
+
+    st.session_state[planner_state_key] = {
+        "fingerprint": visual_plan_fingerprint,
+        "rows": edited_rows,
+    }
+    params.media_plan = (
+        [dict(row) for row in edited_rows] if use_media_plan else None
     )
 
 
@@ -3784,6 +4327,113 @@ def _render_settings_dialog():
                 )
                 _save_material_api_keys("wavespeed_api_keys", wavespeed_api_key)
 
+                st.divider()
+                st.markdown(f"**{tr('ComfyUI Video (Local)')}**")
+                st.caption(
+                    tr(
+                        "Local text-to-video generation through ComfyUI using an exported API workflow. "
+                        "MoneyPrinterTurbo injects prompts and common size/seed fields; model-specific frame counts remain workflow-defined."
+                    )
+                )
+
+                comfyui_video_base_url = st.text_input(
+                    tr("ComfyUI Video Base URL"),
+                    value=str(
+                        config.app.get(
+                            "comfyui_video_base_url",
+                            material.COMFYUI_VIDEO_DEFAULT_BASE_URL,
+                        )
+                        or material.COMFYUI_VIDEO_DEFAULT_BASE_URL
+                    ),
+                    placeholder=material.COMFYUI_VIDEO_DEFAULT_BASE_URL,
+                    key="comfyui_video_base_url_input",
+                )
+                _set_runtime_config(
+                    "app",
+                    "comfyui_video_base_url",
+                    comfyui_video_base_url.strip()
+                    or material.COMFYUI_VIDEO_DEFAULT_BASE_URL,
+                )
+
+                comfyui_video_workflow_path = st.text_input(
+                    tr("ComfyUI Video Workflow Path"),
+                    value=str(
+                        config.app.get("comfyui_video_workflow_path", "") or ""
+                    ),
+                    placeholder=r"E:\MoneyPrinterTurbo\workflows\comfyui-t2v.json",
+                    help=tr("Use an API-format T2V workflow exported from ComfyUI"),
+                    key="comfyui_video_workflow_path_input",
+                )
+                _set_runtime_config(
+                    "app",
+                    "comfyui_video_workflow_path",
+                    comfyui_video_workflow_path.strip(),
+                )
+
+                with st.expander(
+                    tr("ComfyUI Video Advanced Settings"), expanded=False
+                ):
+                    comfyui_video_prompt_template = st.text_area(
+                        tr("ComfyUI Video Prompt Template"),
+                        value=str(
+                            config.app.get(
+                                "comfyui_video_prompt_template", ""
+                            )
+                            or ""
+                        ),
+                        placeholder="{term}",
+                        help=tr(
+                            "Use {term} where the scene prompt should be inserted"
+                        ),
+                        key="comfyui_video_prompt_template_input",
+                    )
+                    _set_runtime_config(
+                        "app",
+                        "comfyui_video_prompt_template",
+                        comfyui_video_prompt_template.strip(),
+                    )
+
+                    comfyui_video_negative_prompt = st.text_area(
+                        tr("ComfyUI Video Negative Prompt"),
+                        value=str(
+                            config.app.get(
+                                "comfyui_video_negative_prompt", ""
+                            )
+                            or ""
+                        ),
+                        placeholder="text, watermark, logo, blurry, low quality",
+                        key="comfyui_video_negative_prompt_input",
+                    )
+                    _set_runtime_config(
+                        "app",
+                        "comfyui_video_negative_prompt",
+                        comfyui_video_negative_prompt.strip(),
+                    )
+
+                    comfyui_video_override_resolution = st.checkbox(
+                        tr("Override ComfyUI Video Workflow Resolution"),
+                        value=material.is_comfyui_video_resolution_override_enabled(
+                            config.snapshot_config_with_pending(config.app)
+                        ),
+                        help=tr(
+                            "Disabled by default because video models may require model-specific dimensions. "
+                            "Enable only when the workflow exposes compatible width/height inputs."
+                        ),
+                        key="comfyui_video_override_resolution_input",
+                    )
+                    _set_runtime_config(
+                        "app",
+                        "comfyui_video_override_resolution",
+                        bool(comfyui_video_override_resolution),
+                    )
+
+                    st.caption(
+                        tr(
+                            "Clip Duration is injected only when the workflow exposes an explicit seconds-based duration input. "
+                            "Frame-count-only workflows keep their own duration and are trimmed during final composition."
+                        )
+                    )
+
 
             with st.container(border=True):
                 st.markdown(f"#### {tr('AI Image Generation APIs')}")
@@ -3856,6 +4506,94 @@ def _render_settings_dialog():
                         "openai_image_prompt_template",
                         openai_image_prompt_template.strip(),
                     )
+                st.divider()
+                st.markdown(f"**{tr('ComfyUI T2I (Local)')}**")
+                st.caption(
+                    tr(
+                        "Local ComfyUI text-to-image generation using an exported API workflow. "
+                        "Mage Flow is tested; common KSampler plus text-encoder workflows are auto-detected."
+                    )
+                )
+
+                comfyui_t2i_base_url = st.text_input(
+                    tr("ComfyUI T2I Base URL"),
+                    value=str(
+                        config.app.get(
+                            "comfyui_t2i_base_url",
+                            config.app.get(
+                                "comfyui_mage_base_url",
+                                material.COMFYUI_T2I_DEFAULT_BASE_URL,
+                            ),
+                        )
+                        or material.COMFYUI_T2I_DEFAULT_BASE_URL
+                    ),
+                    placeholder=material.COMFYUI_T2I_DEFAULT_BASE_URL,
+                    key="comfyui_t2i_base_url_input",
+                )
+                _set_runtime_config(
+                    "app",
+                    "comfyui_t2i_base_url",
+                    comfyui_t2i_base_url.strip() or material.COMFYUI_T2I_DEFAULT_BASE_URL,
+                )
+
+                comfyui_t2i_workflow_path = st.text_input(
+                    tr("ComfyUI T2I Workflow Path"),
+                    value=str(
+                        config.app.get(
+                            "comfyui_t2i_workflow_path",
+                            config.app.get("comfyui_mage_workflow_path", ""),
+                        )
+                        or ""
+                    ),
+                    placeholder=r"E:\MoneyPrinterTurbo\mage-flowT2I.json",
+                    help=tr("Use an API-format workflow exported from ComfyUI"),
+                    key="comfyui_t2i_workflow_path_input",
+                )
+                _set_runtime_config(
+                    "app",
+                    "comfyui_t2i_workflow_path",
+                    comfyui_t2i_workflow_path.strip(),
+                )
+
+                with st.expander(
+                    tr("ComfyUI T2I Advanced Settings"), expanded=False
+                ):
+                    comfyui_t2i_prompt_template = st.text_area(
+                        tr("ComfyUI T2I Prompt Template"),
+                        value=str(
+                            config.app.get(
+                                "comfyui_t2i_prompt_template",
+                                config.app.get("comfyui_mage_prompt_template", ""),
+                            )
+                            or ""
+                        ),
+                        placeholder="{term}",
+                        help=tr("Use {term} where the scene prompt should be inserted"),
+                        key="comfyui_t2i_prompt_template_input",
+                    )
+                    _set_runtime_config(
+                        "app",
+                        "comfyui_t2i_prompt_template",
+                        comfyui_t2i_prompt_template.strip(),
+                    )
+
+                    comfyui_t2i_negative_prompt = st.text_area(
+                        tr("ComfyUI T2I Negative Prompt"),
+                        value=str(
+                            config.app.get(
+                                "comfyui_t2i_negative_prompt",
+                                config.app.get("comfyui_mage_negative_prompt", ""),
+                            )
+                            or ""
+                        ),
+                        placeholder="text, watermark, logo, blurry, low quality",
+                        key="comfyui_t2i_negative_prompt_input",
+                    )
+                    _set_runtime_config(
+                        "app",
+                        "comfyui_t2i_negative_prompt",
+                        comfyui_t2i_negative_prompt.strip(),
+                    )
 
     _save_runtime_config()
 
@@ -3915,9 +4653,14 @@ def _script_generation_method_help(selected_backend):
 def _loomloom_video_scene_prompts(video_terms, subject, scene_count):
     """按素材关键词生成有限数量的场景描述，供视频模型逐段生成素材。"""
     if isinstance(video_terms, str):
-        terms = [
-            term.strip() for term in re.split(r"[,，\n]", video_terms) if term.strip()
-        ]
+        if "\n" in video_terms or "\r" in video_terms:
+            terms = [term.strip() for term in video_terms.splitlines() if term.strip()]
+        else:
+            terms = [
+                term.strip()
+                for term in re.split(r"[,，]", video_terms)
+                if term.strip()
+            ]
     elif isinstance(video_terms, list):
         terms = [
             str(term or "").strip() for term in video_terms if str(term or "").strip()
@@ -4029,6 +4772,101 @@ def _effective_voice_rate_before_audio_panel():
         return 1.0
     return rate if math.isfinite(rate) and rate > 0 else 1.0
 
+
+
+
+def _effective_media_source_mode_before_video_panel() -> str:
+    """Read the current single/hybrid strategy before the video panel is rendered."""
+    mode = st.session_state.get(
+        localized_widget_key("media_source_mode_control"),
+        config.ui.get("media_source_mode", MEDIA_SOURCE_MODE_SINGLE),
+    )
+    mode = str(mode or MEDIA_SOURCE_MODE_SINGLE).strip()
+    return (
+        mode
+        if mode in {MEDIA_SOURCE_MODE_SINGLE, MEDIA_SOURCE_MODE_HYBRID}
+        else MEDIA_SOURCE_MODE_SINGLE
+    )
+
+
+def _effective_video_source_before_video_panel() -> str:
+    """Read the concrete provider used for prompt-mode decisions before the video panel."""
+    if _effective_media_source_mode_before_video_panel() == MEDIA_SOURCE_MODE_HYBRID:
+        # Hybrid planning still needs AI-style visual prompts before the Video Settings
+        # panel is rendered. Use the configured default AI video provider only as a
+        # compatibility anchor; actual generation is dispatched shot-by-shot later.
+        source = st.session_state.get(
+            localized_widget_key("default_ai_video_provider_select"),
+            config.ui.get("default_ai_video_provider", "comfyui_video"),
+        )
+        return _normalize_media_planner_provider(
+            str(source or ""),
+            _media_planner_video_provider_options(),
+            "comfyui_video",
+        )
+
+    source = st.session_state.get(
+        localized_widget_key("video_source_select"),
+        config.app.get("video_source", "pexels"),
+    )
+    return str(source or "pexels").strip() or "pexels"
+
+
+def _effective_video_clip_duration_before_video_panel() -> float:
+    """Read the current per-clip duration before the video panel is rendered."""
+    raw_duration = st.session_state.get(
+        localized_widget_key("video_clip_duration_select"),
+        config.ui.get("video_clip_duration", 3),
+    )
+    try:
+        duration = float(raw_duration)
+    except (TypeError, ValueError, OverflowError):
+        duration = 3.0
+    if not math.isfinite(duration) or duration <= 0:
+        duration = 3.0
+    return duration
+
+
+def _uses_ai_visual_prompts(video_source: str | None = None) -> bool:
+    source = str(video_source or _effective_video_source_before_video_panel()).strip()
+    return llm.should_generate_visual_prompts(source)
+
+
+def _recommended_visual_prompt_plan(
+    script: str,
+    *,
+    voice_rate: float | None = None,
+    clip_duration: float | None = None,
+) -> dict | None:
+    """Estimate prompt count from the midpoint of the local voiceover duration range."""
+    script = str(script or "").strip()
+    if not script:
+        return None
+
+    if voice_rate is None:
+        voice_rate = _effective_voice_rate_before_audio_panel()
+    if clip_duration is None:
+        clip_duration = _effective_video_clip_duration_before_video_panel()
+
+    estimated_range = _estimate_voiceover_duration_range(script, voice_rate)
+    if not estimated_range:
+        return None
+
+    duration_min, duration_max = estimated_range
+    midpoint = (float(duration_min) + float(duration_max)) / 2.0
+    clip_duration = max(float(clip_duration), 0.1)
+    prompt_count = llm.calculate_visual_prompt_count(
+        duration_min,
+        duration_max,
+        clip_duration,
+    )
+    return {
+        "duration_min": float(duration_min),
+        "duration_max": float(duration_max),
+        "midpoint": midpoint,
+        "clip_duration": clip_duration,
+        "prompt_count": prompt_count,
+    }
 
 def _matching_full_voice_preview_duration(script, voice_rate):
     """仅在文案、Provider、音色和语速均未变化时采用完整试听的真实时长。"""
@@ -4398,9 +5236,22 @@ def _loomloom_script_signature(
 
 
 def _render_local_script_generation(params):
-    """保留 MoneyPrinterTurbo 原有的本地 LLM 脚本生成路径。"""
+    """Render the one-click local LLM path for script plus matching visual inputs."""
+    video_source = _effective_video_source_before_video_panel()
+    visual_prompt_mode = _uses_ai_visual_prompts(video_source)
+    button_key = (
+        "Generate Video Script and Visual Prompts"
+        if visual_prompt_mode
+        else "Generate Video Script and Search Terms"
+    )
+    spinner_key = (
+        "Generating Video Script and Visual Prompts"
+        if visual_prompt_mode
+        else "Generating Video Script and Search Terms"
+    )
+
     if not st.button(
-        tr("Generate Video Script and Keywords"),
+        tr(button_key),
         key="auto_generate_script",
         use_container_width=True,
         type="secondary",
@@ -4413,7 +5264,10 @@ def _render_local_script_generation(params):
         st.warning(tr("Please Enter the Video Subject First"))
         return
 
-    with st.spinner(tr("Generating Video Script and Keywords")):
+    voice_rate = _effective_voice_rate_before_audio_panel()
+    clip_duration = _effective_video_clip_duration_before_video_panel()
+
+    with st.spinner(tr(spinner_key)):
 
         def generate_script_and_terms(app_config_snapshot):
             script = llm.generate_script(
@@ -4424,11 +5278,22 @@ def _render_local_script_generation(params):
                 custom_system_prompt=params.custom_system_prompt,
                 app_config=app_config_snapshot,
             )
+            plan = _recommended_visual_prompt_plan(
+                script,
+                voice_rate=voice_rate,
+                clip_duration=clip_duration,
+            )
+            amount = (
+                plan["prompt_count"]
+                if plan
+                else (8 if params.match_materials_to_script else 5)
+            )
             terms = llm.generate_terms(
                 params.video_subject,
                 script,
-                amount=8 if params.match_materials_to_script else 5,
+                amount=amount,
                 match_script_order=params.match_materials_to_script,
+                visual_prompt_mode=visual_prompt_mode,
                 app_config=app_config_snapshot,
             )
             return script, terms
@@ -4439,11 +5304,13 @@ def _render_local_script_generation(params):
         )
         if "Error: " in script:
             st.error(tr(script))
-        elif "Error: " in terms:
+        elif isinstance(terms, str) and "Error: " in terms:
             st.error(tr(terms))
+        elif not terms:
+            st.error(tr("Failed to generate visual prompts or search terms"))
         else:
             st.session_state["video_script"] = script
-            st.session_state["video_terms"] = ", ".join(terms)
+            st.session_state["video_terms"] = "\n".join(terms)
             st.session_state["loomloom_video_scene_autofill_digest"] = (
                 hashlib.sha256(script.strip().encode("utf-8")).hexdigest()
             )
@@ -4482,7 +5349,7 @@ def _render_loomloom_candidates():
         use_container_width=True,
     ):
         st.session_state["video_script"] = selected.script
-        st.session_state["video_terms"] = ", ".join(selected.video_terms)
+        st.session_state["video_terms"] = "\n".join(selected.video_terms)
         # 与普通大模型生成文案保持一致：应用新候选后仅推荐一次素材数量。
         st.session_state["loomloom_video_scene_autofill_digest"] = (
             hashlib.sha256(selected.script.strip().encode("utf-8")).hexdigest()
@@ -4910,40 +5777,96 @@ def _render_script_settings(panel, params):
                 height=180,
                 key="video_script",
             )
+            video_source_for_prompts = _effective_video_source_before_video_panel()
+            visual_prompt_mode = _uses_ai_visual_prompts(video_source_for_prompts)
+            prompt_plan = _recommended_visual_prompt_plan(params.video_script)
+            prompt_label = "Visual Prompts" if visual_prompt_mode else "Video Search Terms"
+            prompt_help = (
+                "Visual Prompts Help"
+                if visual_prompt_mode
+                else "Video Search Terms Help"
+            )
+            generate_prompt_label = (
+                "Generate Visual Prompts"
+                if visual_prompt_mode
+                else "Generate Video Search Terms"
+            )
+            generating_prompt_label = (
+                "Generating Visual Prompts"
+                if visual_prompt_mode
+                else "Generating Video Search Terms"
+            )
+
             if _effective_script_generation_backend() == "loomloom":
                 st.caption(tr("LoomLoom Video Terms Reuse Help"))
             elif st.button(
-                tr("Generate Video Keywords"),
+                tr(generate_prompt_label),
                 key="auto_generate_terms",
                 use_container_width=True,
                 type="secondary",
                 icon=":material/auto_awesome:",
             ):
                 if not params.video_script:
-                    # 视频关键词需要基于文案提取，文案为空时提前提示并跳过模型调用。
                     st.toast(tr("Please Enter the Video Subject"))
                     st.warning(tr("Please Enter the Video Subject"))
                 else:
-                    with st.spinner(tr("Generating Video Keywords")):
+                    amount = (
+                        prompt_plan["prompt_count"]
+                        if prompt_plan
+                        else (8 if params.match_materials_to_script else 5)
+                    )
+                    with st.spinner(tr(generating_prompt_label)):
                         terms = _run_llm_read_operation(
                             "generate_terms",
                             lambda app_config_snapshot: llm.generate_terms(
                                 params.video_subject,
                                 params.video_script,
-                                amount=8 if params.match_materials_to_script else 5,
+                                amount=amount,
                                 match_script_order=params.match_materials_to_script,
+                                visual_prompt_mode=visual_prompt_mode,
                                 app_config=app_config_snapshot,
                             ),
                         )
-                        if "Error: " in terms:
+                        if isinstance(terms, str) and "Error: " in terms:
                             st.error(tr(terms))
+                        elif not terms:
+                            st.error(tr("Failed to generate visual prompts or search terms"))
                         else:
-                            st.session_state["video_terms"] = ", ".join(terms)
+                            st.session_state["video_terms"] = "\n".join(terms)
+
+            pending_visual_shot_prompts = st.session_state.pop(
+                "_pending_visual_shot_prompts", None
+            )
+            if pending_visual_shot_prompts is not None:
+                st.session_state["video_terms"] = str(
+                    pending_visual_shot_prompts or ""
+                )
 
             params.video_terms = st.text_area(
-                tr("Video Keywords"),
-                help=tr("Video Keywords Help"),
+                tr(prompt_label),
+                help=tr(prompt_help),
                 key="video_terms",
+            )
+            if prompt_plan:
+                recommendation_key = (
+                    "Recommended: {count} visual prompts for an estimated midpoint of "
+                    "{midpoint:.1f}s at {clip:.1f}s per clip."
+                    if visual_prompt_mode
+                    else "Recommended: {count} search terms for an estimated midpoint of "
+                    "{midpoint:.1f}s at {clip:.1f}s per clip."
+                )
+                st.caption(
+                    tr(recommendation_key).format(
+                        count=prompt_plan["prompt_count"],
+                        midpoint=prompt_plan["midpoint"],
+                        clip=prompt_plan["clip_duration"],
+                    )
+                )
+            st.caption(
+                tr(
+                    "Use one complete visual prompt or search term per line. Commas inside a line are preserved; "
+                    "single-line comma-separated legacy keywords remain supported for compatibility."
+                )
             )
 
 
@@ -4967,44 +5890,257 @@ def _render_video_settings(panel, params):
                 "metaso_minimax": tr("Metaso MiniMax H3"),
                 "loomloom": tr("Shengsuan Cloud AI Video"),
                 "openai_image": tr("OpenAI Compatible Text-to-Image"),
+                "comfyui_video": tr("ComfyUI Video (Local)"),
+                "comfyui_t2i": tr("ComfyUI T2I (Local)"),
+                "comfyui_mage": tr("ComfyUI T2I (Legacy Mage Alias)"),
                 "local": tr("Local file"),
             }
+            media_source_mode_options = [
+                MEDIA_SOURCE_MODE_SINGLE,
+                MEDIA_SOURCE_MODE_HYBRID,
+            ]
+            media_source_mode_labels = {
+                MEDIA_SOURCE_MODE_SINGLE: tr("Single Source"),
+                MEDIA_SOURCE_MODE_HYBRID: tr("Media Plan (Mixed)"),
+            }
+            params.media_source_mode = stable_segmented_control(
+                tr("Media Source Mode"),
+                options=media_source_mode_options,
+                default_value=_saved_ui_choice(
+                    "media_source_mode",
+                    media_source_mode_options,
+                    MEDIA_SOURCE_MODE_SINGLE,
+                ),
+                key="media_source_mode_control",
+                format_func=lambda value: media_source_mode_labels[value],
+                width="stretch",
+            )
+            _set_runtime_config("ui", "media_source_mode", params.media_source_mode)
+            single_source_mode = params.media_source_mode == MEDIA_SOURCE_MODE_SINGLE
+            hybrid_source_mode = params.media_source_mode == MEDIA_SOURCE_MODE_HYBRID
+
             saved_video_source_name = str(
                 config.app.get("video_source", "pexels") or "pexels"
             )
-            params.video_source = grouped_selectbox(
-                tr("Video Source"),
-                groups=(
-                    (tr("Stock Video"), VIDEO_SOURCE_GROUPS["stock_video"]),
-                    (tr("AI Video"), VIDEO_SOURCE_GROUPS["ai_video"]),
-                    (tr("AI Image"), VIDEO_SOURCE_GROUPS["ai_image"]),
-                    (tr("Local Material"), VIDEO_SOURCE_GROUPS["local"]),
-                ),
-                default_value=saved_video_source_name,
-                key="video_source_select",
-                format_func=video_source_labels.get,
-                settings_label=tr("Configure Material Sources"),
-                on_settings=_open_material_settings_dialog,
-            )
-            _set_runtime_config("app", "video_source", params.video_source)
+            if saved_video_source_name == "comfyui_mage":
+                saved_video_source_name = "comfyui_t2i"
+
+            if single_source_mode:
+                params.video_source = grouped_selectbox(
+                    tr("Video Source"),
+                    groups=(
+                        (tr("Stock Video"), VIDEO_SOURCE_GROUPS["stock_video"]),
+                        (tr("AI Video"), VIDEO_SOURCE_GROUPS["ai_video"]),
+                        (tr("AI Image"), VIDEO_SOURCE_GROUPS["ai_image"]),
+                        (tr("Local Material"), VIDEO_SOURCE_GROUPS["local"]),
+                    ),
+                    default_value=saved_video_source_name,
+                    key="video_source_select",
+                    format_func=video_source_labels.get,
+                    settings_label=tr("Configure Material Sources"),
+                    on_settings=_open_material_settings_dialog,
+                )
+                _set_runtime_config("app", "video_source", params.video_source)
+                # Keep the saved planner defaults available to preview/rebuild Media Plan
+                # even while Single Source is active; they remain hidden until Hybrid mode.
+                params.default_ai_image_provider = _normalize_media_planner_provider(
+                    config.ui.get("default_ai_image_provider", "comfyui_t2i"),
+                    _media_planner_image_provider_options(),
+                    "comfyui_t2i",
+                )
+                params.default_ai_video_provider = _normalize_media_planner_provider(
+                    config.ui.get("default_ai_video_provider", "comfyui_video"),
+                    _media_planner_video_provider_options(),
+                    "comfyui_video",
+                )
+            else:
+                media_planner_provider_labels = _media_planner_provider_labels()
+                ai_image_provider_options = _media_planner_image_provider_options()
+                ai_video_provider_options = _media_planner_video_provider_options()
+                params.default_ai_image_provider = stable_selectbox(
+                    tr("Default AI Image Provider"),
+                    options=ai_image_provider_options,
+                    default_value=_saved_ui_choice(
+                        "default_ai_image_provider",
+                        ai_image_provider_options,
+                        "comfyui_t2i",
+                    ),
+                    key="default_ai_image_provider_select",
+                    format_func=lambda value: media_planner_provider_labels.get(value, value),
+                    help=tr(
+                        "Hybrid Media Planning uses this provider whenever a shot is classified as an image, unless a special rule overrides it."
+                    ),
+                )
+                _set_runtime_config(
+                    "ui",
+                    "default_ai_image_provider",
+                    params.default_ai_image_provider,
+                )
+                params.default_ai_video_provider = stable_selectbox(
+                    tr("Default AI Video Provider"),
+                    options=ai_video_provider_options,
+                    default_value=_saved_ui_choice(
+                        "default_ai_video_provider",
+                        ai_video_provider_options,
+                        "comfyui_video",
+                    ),
+                    key="default_ai_video_provider_select",
+                    format_func=lambda value: media_planner_provider_labels.get(value, value),
+                    help=tr(
+                        "Hybrid Media Planning uses this provider whenever a shot is classified as a video."
+                    ),
+                )
+                _set_runtime_config(
+                    "ui",
+                    "default_ai_video_provider",
+                    params.default_ai_video_provider,
+                )
+                # video_source remains a concrete provider for compatibility with the
+                # existing prompt/timeline plumbing. The hybrid dispatcher ignores this
+                # field once media_plan is attached and routes each shot independently.
+                params.video_source = params.default_ai_video_provider
+                st.caption(
+                    tr(
+                        "The final provider for each shot is defined by Media Plan. The concrete Video Source field is not used for hybrid dispatch."
+                    )
+                )
+                st.button(
+                    tr("Configure Material Sources"),
+                    key="configure_hybrid_material_sources",
+                    use_container_width=True,
+                    on_click=_open_material_settings_dialog,
+                )
 
             loomloom_video_capability = None
-            if params.video_source == "loomloom":
+            if single_source_mode and params.video_source == "loomloom":
                 # 尽早读取缓存，使下方画面比例控件直接受当前 Profile 约束。
                 # 首次输入 Key 后 Streamlit 会 rerun，此处随即加载一次。
                 loomloom_video_capability = _load_loomloom_video_capability(
                     _effective_loomloom_api_token()
                 )
 
-            if params.video_source == "wavespeed":
+            if single_source_mode and params.video_source == "wavespeed":
                 st.caption(tr("WaveSpeed AI Video Help"))
-            if params.video_source == "volcengine_seedance":
+            if single_source_mode and params.video_source == "volcengine_seedance":
                 st.caption(tr("Volcano Engine Seedance Help"))
-            if params.video_source == "ofox":
+            if single_source_mode and params.video_source == "ofox":
                 st.caption(f"[OfoxAI]({OFOX_REFERRAL_URL}) · {tr('OFox AI Video Help')}")
-            if params.video_source == "metaso_minimax":
+            if single_source_mode and params.video_source == "metaso_minimax":
                 st.caption(tr("Metaso MiniMax H3 Help"))
-            if params.video_source == "local":
+            if single_source_mode and params.video_source == "comfyui_video":
+                st.caption(
+                    tr(
+                        "Generate local T2V clips through ComfyUI using an exported API workflow. "
+                        "The selected Clip Duration is used when the workflow exposes seconds directly; otherwise the workflow duration is preserved."
+                    )
+                )
+
+                if st.button(
+                    tr("Generate Subject Anchors + Scene Prompts"),
+                    key="generate_comfyui_subject_anchors_and_scene_prompts",
+                    use_container_width=True,
+                    type="secondary",
+                    icon=":material/hub:",
+                    help=tr(
+                        "Use the current Visual Prompts to identify recurring characters, locations/backgrounds, "
+                        "objects, vehicles, and creatures, then rewrite the same scenes with reusable anchor references."
+                    ),
+                ):
+                    source_terms = params.video_terms or ""
+                    if isinstance(source_terms, list):
+                        source_terms = "\n".join(str(term) for term in source_terms)
+                    if not str(source_terms).strip():
+                        st.toast(tr("Generate Visual Prompts First"))
+                        st.warning(tr("Generate Visual Prompts First"))
+                    else:
+                        with st.spinner(
+                            tr("Generating Subject Anchors and Scene Prompts")
+                        ):
+                            continuity_plan = _run_llm_read_operation(
+                                "generate_subject_anchors_and_scene_prompts",
+                                lambda app_config_snapshot: (
+                                    llm.generate_subject_anchors_and_scene_prompts(
+                                        visual_prompts=source_terms,
+                                        video_subject=params.video_subject,
+                                        video_script=params.video_script,
+                                        app_config=app_config_snapshot,
+                                    )
+                                ),
+                            )
+                        if not continuity_plan:
+                            st.error(
+                                tr("Failed to generate Subject Anchors and Scene Prompts")
+                            )
+                        else:
+                            st.session_state["comfyui_video_subject_anchors"] = (
+                                continuity_plan["subject_anchors"]
+                            )
+                            st.session_state["comfyui_video_scene_prompts"] = "\n".join(
+                                continuity_plan["scene_prompts"]
+                            )
+                            st.toast(
+                                tr(
+                                    "Generated {anchors} Subject Anchors and preserved {scenes} Scene Prompts"
+                                ).format(
+                                    anchors=continuity_plan["anchor_count"],
+                                    scenes=continuity_plan["scene_count"],
+                                )
+                            )
+
+                if "comfyui_video_subject_anchors" not in st.session_state:
+                    st.session_state["comfyui_video_subject_anchors"] = str(
+                        getattr(params, "comfyui_video_subject_anchors", "") or ""
+                    )
+                params.comfyui_video_subject_anchors = st.text_area(
+                    tr("Subject Anchors"),
+                    placeholder=(
+                        "[CHAR_1]\n"
+                        "A lean man in his early thirties with short dark hair, "
+                        "light stubble, and a dark olive jacket\n\n"
+                        "[LOC_1]\n"
+                        "An abandoned wooden cabin in a misty forest clearing\n\n"
+                        "[OBJ_1]\n"
+                        "An old brass lantern with weak flickering light"
+                    ),
+                    help=tr(
+                        "Define reusable visual subjects as [TAG] + description blocks. "
+                        "Tags can represent characters, locations/backgrounds, objects, vehicles, creatures, "
+                        "or any recurring visual element."
+                    ),
+                    height=190,
+                    key="comfyui_video_subject_anchors",
+                ).strip()
+
+                if "comfyui_video_scene_prompts" not in st.session_state:
+                    st.session_state["comfyui_video_scene_prompts"] = str(
+                        getattr(params, "comfyui_video_scene_prompts", "") or ""
+                    )
+                params.comfyui_video_scene_prompts = st.text_area(
+                    tr("Scene Prompts"),
+                    placeholder=(
+                        "[CHAR_1] runs through a dense forest at dusk\n"
+                        "[CHAR_1] sees [LOC_1] in the distance\n"
+                        "[CHAR_1] approaches [LOC_1] carrying [OBJ_1]"
+                    ),
+                    help=tr(
+                        "Use one scene per line. Reference only the anchors needed in that clip. "
+                        "Scene Prompts take precedence over Visual Prompts for ComfyUI Video."
+                    ),
+                    height=190,
+                    key="comfyui_video_scene_prompts",
+                ).strip()
+
+                st.caption(
+                    tr(
+                        "Anchor expansion happens before the global ComfyUI Video Prompt Template, "
+                        "so the template can continue to define the overall visual style."
+                    )
+                )
+            if single_source_mode and params.video_source in {"comfyui_t2i", "comfyui_mage"}:
+                st.caption(
+                    tr("Generate image materials locally through ComfyUI using an exported T2I API workflow; Mage Flow is tested")
+                )
+            if single_source_mode and params.video_source == "local":
                 # Streamlit 的文件类型校验对扩展名大小写敏感，这里同时放行大小写两种形式。
                 local_file_types = sorted(
                     extension.removeprefix(".")
@@ -5016,6 +6152,44 @@ def _render_video_settings(panel, params):
                     + [file_type.upper() for file_type in local_file_types],
                     accept_multiple_files=True,
                     key="local_video_materials_uploader",
+                )
+
+            if hybrid_source_mode or (
+                single_source_mode
+                and params.video_source in {
+                    "local",
+                    "openai_image",
+                    "comfyui_t2i",
+                    "comfyui_mage",
+                }
+            ):
+                still_image_motion_modes = [
+                    (tr("Static"), video.STILL_IMAGE_MOTION_STATIC),
+                    (tr("Slow Zoom In"), video.STILL_IMAGE_MOTION_ZOOM_IN),
+                ]
+                still_image_motion_values = [
+                    value for _, value in still_image_motion_modes
+                ]
+                selected_still_image_motion = stable_selectbox(
+                    tr("Still Image Motion"),
+                    options=still_image_motion_values,
+                    default_value=_saved_ui_choice(
+                        "still_image_motion",
+                        still_image_motion_values,
+                        video.STILL_IMAGE_MOTION_ZOOM_IN,
+                    ),
+                    key="still_image_motion_select",
+                    format_func=lambda value: dict(
+                        (v, label) for label, v in still_image_motion_modes
+                    )[value],
+                    help=tr(
+                        "Choose whether still images remain completely static or use the original slow zoom-in effect."
+                    ),
+                )
+                _set_runtime_config(
+                    "ui",
+                    "still_image_motion",
+                    video.normalize_still_image_motion(selected_still_image_motion),
                 )
 
             # 文案顺序匹配会从关键词生成到最终合成全程保持叙事顺序，因此开启时
@@ -5103,9 +6277,12 @@ def _render_video_settings(panel, params):
             #   - 其他 source 沿用 Portrait(index=0)
             #   - 用户在某 source 下手动改过 aspect,session_state 会记住,
             #     下次回到同一 source 时尊重用户选择,不会再被强制覆盖。
-            default_aspect_index = 1 if params.video_source == "coverr" else 0
+            default_aspect_index = (
+                1 if single_source_mode and params.video_source == "coverr" else 0
+            )
             video_aspect_values = [value for _, value in video_aspect_ratios]
-            video_aspect_config_key = f"video_aspect_{params.video_source}"
+            video_aspect_source_key = "hybrid" if hybrid_source_mode else params.video_source
+            video_aspect_config_key = f"video_aspect_{video_aspect_source_key}"
             selected_aspect_ratio = stable_selectbox(
                 tr("Video Ratio"),
                 options=video_aspect_values,
@@ -5114,7 +6291,7 @@ def _render_video_settings(panel, params):
                     video_aspect_values,
                     video_aspect_ratios[default_aspect_index][1],
                 ),
-                key=f"video_aspect_for_{params.video_source}",
+                key=f"video_aspect_for_{video_aspect_source_key}",
                 format_func=lambda value: dict(
                     (v, label) for label, v in video_aspect_ratios
                 )[value],
@@ -5240,13 +6417,13 @@ def _render_video_settings(panel, params):
             if params.video_source == "loomloom":
                 _render_loomloom_video_settings(params)
 
-            if params.video_source == "wavespeed":
+            if single_source_mode and params.video_source == "wavespeed":
                 _render_wavespeed_video_settings(params)
-            if params.video_source == "volcengine_seedance":
+            if single_source_mode and params.video_source == "volcengine_seedance":
                 _render_seedance_video_settings(params)
-            if params.video_source == "ofox":
+            if single_source_mode and params.video_source == "ofox":
                 _render_ofox_video_settings(params)
-            if params.video_source == "metaso_minimax":
+            if single_source_mode and params.video_source == "metaso_minimax":
                 _render_metaso_minimax_video_settings(params)
     return uploaded_files
 
@@ -5591,12 +6768,29 @@ def _synthesize_voice_preview(
             )
             duration = None
 
+        timeline = None
+        if preview_type == "full" and duration:
+            try:
+                timeline = narration_timeline.build_narration_timeline(
+                    script=content,
+                    audio_duration=duration,
+                    sub_maker=sub_maker,
+                    provider_timing_source=narration_timeline.provider_timing_source(
+                        selected_tts_server
+                    ),
+                ).to_dict()
+            except ValueError as exc:
+                logger.warning(
+                    f"could not build narration timeline for full preview: {exc}"
+                )
+
         return {
             "audio_bytes": audio_bytes,
             "mime_type": _detect_audio_mime(audio_file, audio_bytes),
             "duration": duration,
             "preview_type": preview_type,
             "sub_maker": sub_maker,
+            "narration_timeline": timeline,
             # 让位于音频面板之前的视频面板只采用与当前设置完全匹配的
             # 完整试听时长；短试听或旧文案绝不能改变推荐素材数。
             "content_digest": hashlib.sha256(content.encode("utf-8")).hexdigest(),
@@ -5762,6 +6956,753 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
             else:
                 st.warning(tr("Voice Preview Duration Unavailable"))
 
+            timeline = cached_preview.get("narration_timeline")
+            if isinstance(timeline, dict) and timeline.get("segments"):
+                timing_source = str(timeline.get("timing_source") or "estimated")
+                source_labels = {
+                    "native": tr("Native timing"),
+                    "derived": tr("Derived timing"),
+                    "estimated": tr("Estimated timing"),
+                }
+                st.caption(
+                    tr("Narration Timeline Timing Source").format(
+                        source=source_labels.get(timing_source, timing_source)
+                    )
+                )
+                alignment_unit_count = len(timeline.get("alignment_units", []) or [])
+                if alignment_unit_count:
+                    st.caption(
+                        tr("Fine Alignment Units: {count}").format(
+                            count=alignment_unit_count
+                        )
+                    )
+                with st.expander(tr("Narration Timeline"), expanded=False):
+                    rows = []
+                    for segment in timeline.get("segments", []):
+                        try:
+                            start = float(segment.get("start", 0.0))
+                            end = float(segment.get("end", start))
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                        rows.append(
+                            {
+                                "#": segment.get("index", len(rows) + 1),
+                                tr("Start"): round(start, 2),
+                                tr("End"): round(end, 2),
+                                tr("Duration"): round(max(0.0, end - start), 2),
+                                tr("Narration Text"): segment.get("text", ""),
+                            }
+                        )
+                    if rows:
+                        st.dataframe(rows, hide_index=True, use_container_width=True)
+
+                # Audio-first phase 2 deliberately separates story semantics from media
+                # duration limits. Semantic scenes depend only on narration structure;
+                # Clip Duration is applied afterwards as a hard maximum for media shots.
+                try:
+                    semantic_timeline = visual_timeline.build_visual_timeline(timeline)
+                    shot_plan = media_shot_plan.build_media_shot_plan(
+                        semantic_timeline,
+                        max_clip_duration=float(params.video_clip_duration or 5),
+                    )
+                except (TypeError, ValueError) as exc:
+                    logger.warning(f"could not build visual media plan preview: {exc}")
+                else:
+                    semantic_data = semantic_timeline.to_dict()
+                    scene_segments = semantic_data.get("segments", [])
+                    shot_data = shot_plan.to_dict()
+                    shots = shot_data.get("shots", [])
+
+                    if scene_segments:
+                        st.caption(
+                            tr(
+                                "Semantic Scenes: {count}. These boundaries are independent of Clip Duration."
+                            ).format(count=len(scene_segments))
+                        )
+                        with st.expander(tr("Semantic Scene Timeline"), expanded=False):
+                            scene_rows = []
+                            for scene in scene_segments:
+                                try:
+                                    start = float(scene.get("start", 0.0))
+                                    end = float(scene.get("end", start))
+                                except (TypeError, ValueError, OverflowError):
+                                    continue
+                                source_indices = list(scene.get("narration_indices", []) or [])
+                                if source_indices:
+                                    first_source = source_indices[0]
+                                    last_source = source_indices[-1]
+                                    narration_range = (
+                                        str(first_source)
+                                        if first_source == last_source
+                                        else f"{first_source}–{last_source}"
+                                    )
+                                else:
+                                    narration_range = ""
+                                scene_rows.append(
+                                    {
+                                        tr("Scene"): scene.get("index", len(scene_rows) + 1),
+                                        tr("Start"): round(start, 2),
+                                        tr("End"): round(end, 2),
+                                        tr("Duration"): round(max(0.0, end - start), 2),
+                                        tr("Narration Units"): narration_range,
+                                        tr("Narration Text"): scene.get("narration_text", ""),
+                                    }
+                                )
+                            if scene_rows:
+                                st.dataframe(
+                                    scene_rows, hide_index=True, use_container_width=True
+                                )
+
+                    if shots:
+                        maximum = float(shot_data.get("max_clip_duration", 5.0))
+                        minimum = float(
+                            shot_data.get(
+                                "min_clip_duration",
+                                min(
+                                    media_shot_plan.DEFAULT_MINIMUM_SHOT_DURATION,
+                                    maximum,
+                                ),
+                            )
+                        )
+
+                        # There is exactly one shot plan that matters downstream: the Active Shot Plan.
+                        # Start with the deterministic plan and replace it only when a current, validated
+                        # AI refinement exists. The original and refined plans are no longer presented as
+                        # two competing tables that the user has to reconcile manually.
+                        active_shot_plan = shot_plan
+                        active_shot_data = shot_data
+                        active_plan_source = "automatic"
+                        active_refinement_summary = None
+
+                        try:
+                            refinement_candidates = (
+                                media_shot_refinement.build_refinement_candidates(
+                                    semantic_timeline, shot_plan
+                                )
+                            )
+                        except (TypeError, ValueError) as exc:
+                            logger.warning(
+                                f"could not build AI shot refinement candidates: {exc}"
+                            )
+                            refinement_candidates = []
+
+                        if refinement_candidates:
+                            refinement_fingerprint_payload = {
+                                "semantic_timeline": semantic_data,
+                                "shot_plan": shot_data,
+                            }
+                            refinement_fingerprint = hashlib.sha256(
+                                json.dumps(
+                                    refinement_fingerprint_payload,
+                                    sort_keys=True,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                ).encode("utf-8")
+                            ).hexdigest()
+
+                            st.caption(
+                                tr(
+                                    "Optional AI refinement can review {count} uncertain internal cuts. "
+                                    "It may only choose existing validated boundaries; timing coverage, "
+                                    "shot count, order, preferred minimum, and hard maximum remain constrained."
+                                ).format(count=len(refinement_candidates))
+                            )
+                            if st.button(
+                                tr("Refine Active Shot Plan with AI"),
+                                key="refine_media_shot_plan_with_ai",
+                                use_container_width=True,
+                                type="secondary",
+                                icon=":material/auto_awesome:",
+                            ):
+                                try:
+                                    with st.spinner(tr("Refining Active Shot Plan")):
+                                        refinement_result = _run_llm_read_operation(
+                                            "refine_media_shot_plan",
+                                            lambda app_config_snapshot: (
+                                                media_shot_refinement.refine_media_shot_plan(
+                                                    semantic_timeline,
+                                                    shot_plan,
+                                                    response_generator=lambda prompt: llm._generate_response(
+                                                        prompt=prompt,
+                                                        app_config=app_config_snapshot,
+                                                    ),
+                                                )
+                                            ),
+                                        )
+                                except Exception as exc:
+                                    logger.exception("AI media shot refinement failed")
+                                    st.warning(
+                                        tr("AI Shot Refinement Failed").format(
+                                            error=str(exc)
+                                        )
+                                    )
+                                else:
+                                    st.session_state["media_shot_refinement_preview"] = {
+                                        "fingerprint": refinement_fingerprint,
+                                        "result": refinement_result.to_dict(),
+                                    }
+                                    # A changed shot plan invalidates every downstream visual/media plan.
+                                    st.session_state.pop("visual_shot_plan_preview", None)
+                                    st.session_state.pop("media_plan_preview", None)
+                                    st.session_state.pop(
+                                        "applied_visual_shot_plan_fingerprint", None
+                                    )
+                                    st.session_state.pop(
+                                        "applied_visual_shot_plan_voice_fingerprint", None
+                                    )
+
+                            cached_refinement = st.session_state.get(
+                                "media_shot_refinement_preview"
+                            )
+                            if (
+                                isinstance(cached_refinement, dict)
+                                and cached_refinement.get("fingerprint")
+                                == refinement_fingerprint
+                                and isinstance(cached_refinement.get("result"), dict)
+                            ):
+                                refined_result = cached_refinement["result"]
+                                refined_plan = refined_result.get("plan", {}) or {}
+                                refined_shots = list(refined_plan.get("shots", []) or [])
+                                # The refinement service guarantees the same shot count and rebuilds
+                                # through the deterministic validator. Keep a defensive UI check too.
+                                if refined_shots and len(refined_shots) == len(shots):
+                                    active_shot_plan = refined_plan
+                                    active_shot_data = refined_plan
+                                    active_plan_source = "ai_refined"
+                                    active_refinement_summary = tr(
+                                        "AI reviewed {eligible} candidate scenes and changed {refined}; "
+                                        "rejected choices: {rejected}."
+                                    ).format(
+                                        eligible=refined_result.get(
+                                            "eligible_scene_count", 0
+                                        ),
+                                        refined=refined_result.get(
+                                            "refined_scene_count", 0
+                                        ),
+                                        rejected=refined_result.get(
+                                            "rejected_choice_count", 0
+                                        ),
+                                    )
+
+                                    if st.button(
+                                        tr("Use Automatic Shot Plan"),
+                                        key="discard_media_shot_plan_refinement",
+                                        use_container_width=True,
+                                        help=tr(
+                                            "Discard the current AI refinement and return the deterministic Media Shot Plan to Active Shot Plan."
+                                        ),
+                                    ):
+                                        st.session_state.pop(
+                                            "media_shot_refinement_preview", None
+                                        )
+                                        st.session_state.pop(
+                                            "visual_shot_plan_preview", None
+                                        )
+                                        st.session_state.pop("media_plan_preview", None)
+                                        st.session_state.pop(
+                                            "applied_visual_shot_plan_fingerprint", None
+                                        )
+                                        st.session_state.pop(
+                                            "applied_visual_shot_plan_voice_fingerprint",
+                                            None,
+                                        )
+                                        st.rerun()
+
+                        active_shots = list(active_shot_data.get("shots", []) or [])
+                        active_maximum = float(
+                            active_shot_data.get("max_clip_duration", maximum) or maximum
+                        )
+                        active_minimum = float(
+                            active_shot_data.get("min_clip_duration", minimum) or minimum
+                        )
+                        active_undersized_count = int(
+                            active_shot_data.get("undersized_shot_count", 0) or 0
+                        )
+                        active_estimated_cut_count = sum(
+                            1
+                            for shot in active_shots
+                            if shot.get("uses_internal_estimate")
+                        )
+
+                        source_label = (
+                            tr("AI-Refined")
+                            if active_plan_source == "ai_refined"
+                            else tr("Automatic")
+                        )
+                        st.caption(
+                            tr(
+                                "Active Shot Plan: {source} · {count} shots · preferred minimum "
+                                "{minimum:.1f}s · hard maximum {maximum:.1f}s."
+                            ).format(
+                                source=source_label,
+                                count=len(active_shots),
+                                minimum=active_minimum,
+                                maximum=active_maximum,
+                            )
+                        )
+                        if active_refinement_summary:
+                            st.caption(active_refinement_summary)
+                        if active_undersized_count:
+                            st.caption(
+                                tr(
+                                    "{count} active shots remain below the preferred minimum because "
+                                    "no safe boundary adjustment can remove them without breaking the hard maximum."
+                                ).format(count=active_undersized_count)
+                            )
+                        if active_estimated_cut_count:
+                            st.caption(
+                                tr(
+                                    "{count} active shots still use an internal duration-limit cut because "
+                                    "no validated narration/alignment boundary was available at a safe position."
+                                ).format(count=active_estimated_cut_count)
+                            )
+
+                        with st.expander(tr("Active Shot Plan"), expanded=False):
+                            active_rows = []
+                            for active_shot in active_shots:
+                                try:
+                                    active_start = float(
+                                        active_shot.get("start", 0.0)
+                                    )
+                                    active_end = float(
+                                        active_shot.get("end", active_start)
+                                    )
+                                except (
+                                    TypeError,
+                                    ValueError,
+                                    OverflowError,
+                                ):
+                                    continue
+                                active_scene_indices = list(
+                                    active_shot.get("scene_indices", [])
+                                    or [active_shot.get("scene_index", "")]
+                                )
+                                active_scene_indices = [
+                                    value
+                                    for value in active_scene_indices
+                                    if value != ""
+                                ]
+                                if active_scene_indices:
+                                    first_active_scene = active_scene_indices[0]
+                                    last_active_scene = active_scene_indices[-1]
+                                    active_scene_range = (
+                                        str(first_active_scene)
+                                        if first_active_scene == last_active_scene
+                                        else f"{first_active_scene}–{last_active_scene}"
+                                    )
+                                else:
+                                    active_scene_range = ""
+
+                                active_narration_indices = list(
+                                    active_shot.get("narration_indices", []) or []
+                                )
+                                if active_narration_indices:
+                                    first_active_narration = active_narration_indices[0]
+                                    last_active_narration = active_narration_indices[-1]
+                                    active_narration_range = (
+                                        str(first_active_narration)
+                                        if first_active_narration
+                                        == last_active_narration
+                                        else f"{first_active_narration}–{last_active_narration}"
+                                    )
+                                else:
+                                    active_narration_range = ""
+
+                                active_end_source = str(
+                                    active_shot.get("end_boundary_source")
+                                    or "scene_boundary"
+                                )
+                                active_cut_label = {
+                                    "scene_boundary": tr("Scene boundary"),
+                                    "narration_boundary": tr("Narration boundary"),
+                                    "alignment_boundary": tr("Aligned boundary"),
+                                    "balanced_internal_cut": tr("Duration-limit cut"),
+                                }.get(active_end_source, active_end_source)
+                                active_rows.append(
+                                    {
+                                        "#": active_shot.get(
+                                            "index", len(active_rows) + 1
+                                        ),
+                                        tr("Scene"): active_scene_range,
+                                        tr("Start"): round(active_start, 2),
+                                        tr("End"): round(active_end, 2),
+                                        tr("Duration"): round(
+                                            max(0.0, active_end - active_start),
+                                            2,
+                                        ),
+                                        tr("End Cut"): active_cut_label,
+                                        tr("Narration Units"): active_narration_range,
+                                        tr("Narration Text"): active_shot.get(
+                                            "narration_text", ""
+                                        ),
+                                    }
+                                )
+                            if active_rows:
+                                st.dataframe(
+                                    active_rows,
+                                    hide_index=True,
+                                    use_container_width=True,
+                                )
+
+                        # The Active Shot Plan is the only timing plan handed to the visual layer.
+                        # Generating visual prompts also applies them immediately, removing the former
+                        # "Generate Visual Shot Plan" -> table -> "Use as Visual Prompts" ceremony.
+                        if _uses_ai_visual_prompts(params.video_source):
+                            visual_plan_fingerprint_payload = {
+                                "shot_plan": active_shot_data,
+                                "video_subject": str(
+                                    params.video_subject or ""
+                                ).strip(),
+                            }
+                            visual_plan_fingerprint = hashlib.sha256(
+                                json.dumps(
+                                    visual_plan_fingerprint_payload,
+                                    sort_keys=True,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                ).encode("utf-8")
+                            ).hexdigest()
+
+                            try:
+                                visual_payload = (
+                                    visual_shot_planner.build_visual_shot_payload(
+                                        active_shot_plan
+                                    )
+                                )
+                            except (TypeError, ValueError) as exc:
+                                logger.warning(
+                                    f"could not build visual shot planner payload: {exc}"
+                                )
+                                visual_payload = []
+
+                            # Any previously applied plan belongs to another Active Shot Plan when
+                            # its fingerprint differs. Invalidate it before Generate Video can reuse
+                            # stale timing.
+                            applied_visual_fingerprint = str(
+                                st.session_state.get(
+                                    "applied_visual_shot_plan_fingerprint", ""
+                                )
+                                or ""
+                            )
+                            if (
+                                applied_visual_fingerprint
+                                and applied_visual_fingerprint
+                                != visual_plan_fingerprint
+                            ):
+                                st.session_state.pop(
+                                    "applied_visual_shot_plan_fingerprint", None
+                                )
+                                st.session_state.pop(
+                                    "applied_visual_shot_plan_voice_fingerprint", None
+                                )
+                                st.session_state.pop("media_plan_preview", None)
+
+                            if visual_payload:
+                                shared_narration_count = sum(
+                                    1
+                                    for item in visual_payload
+                                    if item.get("shared_narration_with_previous")
+                                )
+                                st.caption(
+                                    tr(
+                                        "Generate one unique visual prompt for each of the {count} Active Shot Plan windows. "
+                                        "{shared} shots continue narration already present in the previous shot. "
+                                        "The generated prompts are applied to Visual Prompts automatically."
+                                    ).format(
+                                        count=len(visual_payload),
+                                        shared=shared_narration_count,
+                                    )
+                                )
+
+                                if st.button(
+                                    tr(
+                                        "Generate Visual Prompts from Active Shot Plan"
+                                    ),
+                                    key="generate_visual_prompts_from_active_shot_plan",
+                                    use_container_width=True,
+                                    type="primary",
+                                    icon=":material/movie_edit:",
+                                ):
+                                    try:
+                                        with st.spinner(
+                                            tr(
+                                                "Generating Visual Prompts from Active Shot Plan"
+                                            )
+                                        ):
+                                            visual_plan_result = _run_llm_read_operation(
+                                                "generate_visual_shot_plan",
+                                                lambda app_config_snapshot: (
+                                                    visual_shot_planner.generate_visual_shot_plan(
+                                                        active_shot_plan,
+                                                        video_subject=params.video_subject,
+                                                        response_generator=lambda prompt: llm._generate_response(
+                                                            prompt=prompt,
+                                                            app_config=app_config_snapshot,
+                                                        ),
+                                                    )
+                                                ),
+                                            )
+                                    except Exception as exc:
+                                        logger.exception(
+                                            "AI visual shot planning failed"
+                                        )
+                                        st.warning(
+                                            tr(
+                                                "Visual Shot Planning Failed"
+                                            ).format(error=str(exc))
+                                        )
+                                    else:
+                                        visual_plan_data = (
+                                            visual_plan_result.to_dict()
+                                        )
+                                        visual_prompt_lines = [
+                                            str(prompt or "").strip()
+                                            for prompt in visual_plan_data.get(
+                                                "visual_prompts", []
+                                            )
+                                            if str(prompt or "").strip()
+                                        ]
+                                        if len(visual_prompt_lines) != len(
+                                            visual_payload
+                                        ):
+                                            st.error(
+                                                tr(
+                                                    "Visual Shot Planning Failed"
+                                                ).format(
+                                                    error=(
+                                                        "the generated visual prompt count "
+                                                        "does not match Active Shot Plan"
+                                                    )
+                                                )
+                                            )
+                                        else:
+                                            st.session_state[
+                                                "visual_shot_plan_preview"
+                                            ] = {
+                                                "fingerprint": visual_plan_fingerprint,
+                                                "result": visual_plan_data,
+                                            }
+                                            st.session_state[
+                                                "_pending_visual_shot_prompts"
+                                            ] = "\n".join(visual_prompt_lines)
+                                            st.session_state[
+                                                "applied_visual_shot_plan_fingerprint"
+                                            ] = visual_plan_fingerprint
+                                            st.session_state[
+                                                "applied_visual_shot_plan_voice_fingerprint"
+                                            ] = str(
+                                                cached_preview.get(
+                                                    "fingerprint", ""
+                                                )
+                                                if isinstance(
+                                                    cached_preview, dict
+                                                )
+                                                else ""
+                                            )
+                                            # A new visual plan must rebuild any per-shot hybrid
+                                            # provider proposal from those exact new prompts.
+                                            st.session_state.pop(
+                                                "media_plan_preview", None
+                                            )
+                                            st.rerun()
+
+                                cached_visual_plan = st.session_state.get(
+                                    "visual_shot_plan_preview"
+                                )
+                                if (
+                                    isinstance(cached_visual_plan, dict)
+                                    and cached_visual_plan.get("fingerprint")
+                                    == visual_plan_fingerprint
+                                    and isinstance(
+                                        cached_visual_plan.get("result"), dict
+                                    )
+                                ):
+                                    visual_plan_data = cached_visual_plan["result"]
+                                    visual_shots = list(
+                                        visual_plan_data.get("shots", []) or []
+                                    )
+                                    visual_prompt_lines = [
+                                        str(prompt or "").strip()
+                                        for prompt in visual_plan_data.get(
+                                            "visual_prompts", []
+                                        )
+                                        if str(prompt or "").strip()
+                                    ]
+                                    current_prompt_lines = (
+                                        _video_term_lines_for_timeline(
+                                            getattr(params, "video_terms", None)
+                                        )
+                                    )
+                                    visual_plan_applied = (
+                                        bool(visual_prompt_lines)
+                                        and current_prompt_lines
+                                        == visual_prompt_lines
+                                        and str(
+                                            st.session_state.get(
+                                                "applied_visual_shot_plan_fingerprint",
+                                                "",
+                                            )
+                                            or ""
+                                        )
+                                        == visual_plan_fingerprint
+                                    )
+
+                                    if visual_plan_applied:
+                                        st.success(
+                                            tr(
+                                                "{count} Visual Prompts from Active Shot Plan are applied."
+                                            ).format(
+                                                count=len(visual_prompt_lines)
+                                            )
+                                        )
+                                    else:
+                                        st.warning(
+                                            tr(
+                                                "The generated Visual Prompts are no longer applied. Regenerate them from Active Shot Plan before timeline-aware generation."
+                                            )
+                                        )
+
+                                    # Per-shot provider planning is a hybrid-only concern. Single
+                                    # Source stops here and uses the selected Video Source for every
+                                    # locked shot.
+                                    if (
+                                        str(
+                                            getattr(
+                                                params,
+                                                "media_source_mode",
+                                                MEDIA_SOURCE_MODE_SINGLE,
+                                            )
+                                            or ""
+                                        )
+                                        == MEDIA_SOURCE_MODE_HYBRID
+                                        and visual_plan_applied
+                                        and visual_shots
+                                    ):
+                                        _render_media_planner(
+                                            visual_shots,
+                                            visual_plan_fingerprint,
+                                            params,
+                                        )
+
+
+def _video_term_lines_for_timeline(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(item or "").strip() for item in value if str(item or "").strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    if "\n" in text or "\r" in text:
+        return [line.strip() for line in text.splitlines() if line.strip()]
+    # A Visual Shot Plan is always applied as one prompt per line. A single line is
+    # one prompt here; do not split its internal commas.
+    return [text]
+
+
+def _has_explicit_current_media_plan(params) -> bool:
+    if (
+        str(getattr(params, "media_source_mode", MEDIA_SOURCE_MODE_SINGLE) or "")
+        != MEDIA_SOURCE_MODE_HYBRID
+    ):
+        return False
+
+    raw_media_plan = getattr(params, "media_plan", None)
+    if not isinstance(raw_media_plan, list) or not raw_media_plan:
+        return False
+    cached_plan = st.session_state.get("visual_shot_plan_preview")
+    if not isinstance(cached_plan, dict) or not isinstance(cached_plan.get("result"), dict):
+        return False
+    applied_fingerprint = str(
+        st.session_state.get("applied_visual_shot_plan_fingerprint", "") or ""
+    )
+    if not applied_fingerprint or cached_plan.get("fingerprint") != applied_fingerprint:
+        return False
+    result = cached_plan["result"]
+    planned_prompts = [
+        str(prompt or "").strip()
+        for prompt in list(result.get("visual_prompts", []) or [])
+        if str(prompt or "").strip()
+    ]
+    current_prompts = _video_term_lines_for_timeline(getattr(params, "video_terms", None))
+    return bool(planned_prompts and current_prompts == planned_prompts)
+
+
+def _matching_applied_media_shot_timeline(
+    params, reusable_voice_preview: dict | None
+) -> list[dict] | None:
+    raw_media_plan = getattr(params, "media_plan", None) or None
+    if not raw_media_plan and not timeline_media.is_timeline_aware_generated_source(
+        getattr(params, "video_source", None)
+    ):
+        return None
+
+    cached_plan = st.session_state.get("visual_shot_plan_preview")
+    if not isinstance(cached_plan, dict) or not isinstance(cached_plan.get("result"), dict):
+        return None
+
+    applied_plan_fingerprint = str(
+        st.session_state.get("applied_visual_shot_plan_fingerprint", "") or ""
+    )
+    if not applied_plan_fingerprint or cached_plan.get("fingerprint") != applied_plan_fingerprint:
+        return None
+
+    result = cached_plan["result"]
+    planned_prompts = [
+        str(prompt or "").strip()
+        for prompt in list(result.get("visual_prompts", []) or [])
+        if str(prompt or "").strip()
+    ]
+    current_prompts = _video_term_lines_for_timeline(getattr(params, "video_terms", None))
+    raw_shots = list(result.get("shots", []) or [])
+    # If the user edited/replaced the applied prompts, treat the timeline as no
+    # longer active rather than guessing which shot an edited line belongs to.
+    if not planned_prompts or current_prompts != planned_prompts:
+        return None
+    if len(raw_shots) != len(planned_prompts):
+        raise timeline_media.TimelineMediaError(
+            "the applied Visual Shot Plan no longer contains one timing window per prompt"
+        )
+
+    if not reusable_voice_preview:
+        raise timeline_media.TimelineMediaError(
+            "the applied Visual Shot Plan requires the matching Full Audio preview; "
+            "generate Full Audio again before starting timeline-aware generation"
+        )
+
+    applied_voice_fingerprint = str(
+        st.session_state.get("applied_visual_shot_plan_voice_fingerprint", "") or ""
+    )
+    current_voice_preview = st.session_state.get("voice_preview_audio")
+    current_voice_fingerprint = str(
+        current_voice_preview.get("fingerprint", "")
+        if isinstance(current_voice_preview, dict)
+        else ""
+    )
+    if (
+        not applied_voice_fingerprint
+        or current_voice_fingerprint != applied_voice_fingerprint
+    ):
+        raise timeline_media.TimelineMediaError(
+            "the applied Visual Shot Plan belongs to a different voiceover preview; "
+            "regenerate the Visual Shot Plan after the current Full Audio"
+        )
+
+    duration = reusable_voice_preview.get("duration")
+    normalized_timeline = timeline_media.normalize_locked_shot_timeline(
+        raw_shots,
+        audio_duration=float(duration),
+        max_clip_duration=float(getattr(params, "video_clip_duration", 5) or 5),
+        expected_count=len(planned_prompts),
+    )
+    if raw_media_plan:
+        params.media_plan = timeline_media.normalize_hybrid_media_plan(
+            raw_media_plan,
+            normalized_timeline,
+            planned_prompts,
+            audio_duration=float(duration),
+            max_clip_duration=float(getattr(params, "video_clip_duration", 5) or 5),
+        )
+    return normalized_timeline
+
 
 def _get_reusable_full_voice_preview(params, voice_mode: str) -> dict | None:
     """
@@ -5818,6 +7759,7 @@ def _get_reusable_full_voice_preview(params, voice_mode: str) -> dict | None:
         "audio_bytes": bytes(cached_preview["audio_bytes"]),
         "duration": float(duration),
         "sub_maker": cached_preview["sub_maker"],
+        "narration_timeline": cached_preview.get("narration_timeline"),
         "script": script_content,
         "voice_name": params.voice_name,
         "voice_rate": float(params.voice_rate),
@@ -7335,6 +9277,20 @@ def _render_generation_controls(
             st.error(tr("Video Script and Subject Cannot Both Be Empty"))
             st.stop()
 
+        hybrid_mode_requested = (
+            str(getattr(params, "media_source_mode", MEDIA_SOURCE_MODE_SINGLE) or "")
+            == MEDIA_SOURCE_MODE_HYBRID
+        )
+        hybrid_media_plan_candidate = _has_explicit_current_media_plan(params)
+        if hybrid_mode_requested and not hybrid_media_plan_candidate:
+            _remove_active_generation_task(task_id)
+            st.error(
+                tr(
+                    "Media Plan (Mixed) requires current Visual Prompts generated from Active Shot Plan and a valid Hybrid Media Plan. Generate Full Audio, build/refine Active Shot Plan if desired, generate its Visual Prompts, then review Hybrid Media Planning before generating."
+                )
+            )
+            st.stop()
+
         if params.video_source not in [
             "pexels",
             "pixabay",
@@ -7345,48 +9301,51 @@ def _render_generation_controls(
             "metaso_minimax",
             "loomloom",
             "openai_image",
+            "comfyui_video",
+            "comfyui_t2i",
+            "comfyui_mage",
             "local",
         ]:
             _remove_active_generation_task(task_id)
             st.error(tr("Please Select a Valid Video Source"))
             st.stop()
 
-        if params.video_source == "pexels" and not config.app.get(
+        if not hybrid_media_plan_candidate and params.video_source == "pexels" and not config.app.get(
             "pexels_api_keys", ""
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Please Enter the Pexels API Key"))
             st.stop()
 
-        if params.video_source == "pixabay" and not config.app.get(
+        if not hybrid_media_plan_candidate and params.video_source == "pixabay" and not config.app.get(
             "pixabay_api_keys", ""
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Please Enter the Pixabay API Key"))
             st.stop()
 
-        if params.video_source == "coverr" and not config.app.get(
+        if not hybrid_media_plan_candidate and params.video_source == "coverr" and not config.app.get(
             "coverr_api_keys", ""
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Please Enter the Coverr API Key"))
             st.stop()
 
-        if params.video_source == "wavespeed" and not config.app.get(
+        if not hybrid_media_plan_candidate and params.video_source == "wavespeed" and not config.app.get(
             "wavespeed_api_keys", ""
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Please Enter the WaveSpeed API Key"))
             st.stop()
 
-        if params.video_source == "wavespeed" and not st.session_state.get(
+        if not hybrid_media_plan_candidate and params.video_source == "wavespeed" and not st.session_state.get(
             "wavespeed_confirm_charge", False
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Confirm WaveSpeed Charge Required"))
             st.stop()
 
-        if params.video_source == "volcengine_seedance" and not (
+        if not hybrid_media_plan_candidate and params.video_source == "volcengine_seedance" and not (
             volcengine_seedance.is_enabled(
                 config.snapshot_config_with_pending(config.app)
             )
@@ -7395,28 +9354,28 @@ def _render_generation_controls(
             st.error(tr("Please Enter the Volcano Engine Ark API Key"))
             st.stop()
 
-        if params.video_source == "volcengine_seedance" and not st.session_state.get(
+        if not hybrid_media_plan_candidate and params.video_source == "volcengine_seedance" and not st.session_state.get(
             "volcengine_seedance_confirm_charge", False
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Confirm Volcano Engine Seedance Charge Required"))
             st.stop()
 
-        if params.video_source == "ofox" and not (
+        if not hybrid_media_plan_candidate and params.video_source == "ofox" and not (
             ofox.is_enabled(config.snapshot_config_with_pending(config.app))
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Please Enter the OFox API Key"))
             st.stop()
 
-        if params.video_source == "ofox" and not st.session_state.get(
+        if not hybrid_media_plan_candidate and params.video_source == "ofox" and not st.session_state.get(
             "ofox_confirm_charge", False
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Confirm OFox Charge Required"))
             st.stop()
 
-        if params.video_source == "metaso_minimax" and not (
+        if not hybrid_media_plan_candidate and params.video_source == "metaso_minimax" and not (
             metaso_minimax.is_enabled(
                 config.snapshot_config_with_pending(config.app)
             )
@@ -7425,22 +9384,40 @@ def _render_generation_controls(
             st.error(tr("Please Enter the Metaso MiniMax API Key"))
             st.stop()
 
-        if params.video_source == "metaso_minimax" and not st.session_state.get(
+        if not hybrid_media_plan_candidate and params.video_source == "metaso_minimax" and not st.session_state.get(
             "metaso_minimax_confirm_charge", False
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Confirm Metaso MiniMax Charge Required"))
             st.stop()
 
-        if params.video_source == "openai_image" and not material.is_openai_image_enabled(
+        if not hybrid_media_plan_candidate and params.video_source == "openai_image" and not material.is_openai_image_enabled(
             config.snapshot_config_with_pending(config.app)
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Please Configure the OpenAI Image Source"))
             st.stop()
 
+        if not hybrid_media_plan_candidate and params.video_source in {"comfyui_t2i", "comfyui_mage"} and not material.is_comfyui_t2i_enabled(
+            config.snapshot_config_with_pending(config.app)
+        ):
+            _remove_active_generation_task(task_id)
+            st.error(
+                "Configura la URL de ComfyUI y la ruta de un workflow T2I exportado en formato API."
+            )
+            st.stop()
+
+        if not hybrid_media_plan_candidate and params.video_source == "comfyui_video" and not material.is_comfyui_video_enabled(
+            config.snapshot_config_with_pending(config.app)
+        ):
+            _remove_active_generation_task(task_id)
+            st.error(
+                "Configura la URL de ComfyUI y la ruta de un workflow T2V exportado en formato API."
+            )
+            st.stop()
+
         loomloom_video_request = None
-        if params.video_source == "loomloom":
+        if not hybrid_media_plan_candidate and params.video_source == "loomloom":
             current_batch, current_signature = _current_loomloom_video_quote_context(
                 params
             )
@@ -7607,6 +9584,60 @@ def _render_generation_controls(
             params,
             voice_mode,
         )
+
+        # The Media Plan is advisory until the user explicitly enables hybrid
+        # dispatch. Keeping it out of VideoParams here preserves both the legacy
+        # path and the already-validated single-provider timeline path.
+        if not hybrid_media_plan_candidate:
+            params.media_plan = None
+
+        try:
+            params.media_shot_timeline = _matching_applied_media_shot_timeline(
+                params,
+                reusable_voice_preview,
+            )
+        except timeline_media.TimelineMediaError as exc:
+            _remove_active_generation_task(task_id)
+            st.error(str(exc))
+            st.stop()
+
+        if not params.media_shot_timeline:
+            params.media_plan = None
+        elif hybrid_media_plan_candidate and not params.media_plan:
+            _remove_active_generation_task(task_id)
+            st.error("The applied Media Plan could not be attached to the locked shot timeline.")
+            st.stop()
+
+        if params.media_plan:
+            planned_providers = timeline_media.hybrid_media_plan_providers(params.media_plan)
+            app_config_snapshot = config.snapshot_config_with_pending(config.app)
+            if "openai_image" in planned_providers and not material.is_openai_image_enabled(app_config_snapshot):
+                _remove_active_generation_task(task_id)
+                st.error(tr("Please Configure the OpenAI Image Source"))
+                st.stop()
+            if "comfyui_t2i" in planned_providers and not material.is_comfyui_t2i_enabled(app_config_snapshot):
+                _remove_active_generation_task(task_id)
+                st.error("Configura la URL de ComfyUI y la ruta de un workflow T2I exportado en formato API.")
+                st.stop()
+            if "comfyui_video" in planned_providers and not material.is_comfyui_video_enabled(app_config_snapshot):
+                _remove_active_generation_task(task_id)
+                st.error("Configura la URL de ComfyUI y la ruta de un workflow T2V exportado en formato API.")
+                st.stop()
+            logger.info(
+                "hybrid media plan attached to generation request: "
+                f"shots={len(params.media_plan)}, providers={sorted(planned_providers)}"
+            )
+            st.toast(tr("Hybrid Media Plan enabled"))
+
+        if params.media_shot_timeline:
+            logger.info(
+                "audio-first timeline attached to generation request: "
+                f"source={params.video_source}, shots={len(params.media_shot_timeline)}"
+            )
+            st.toast(
+                tr("Audio-first shot timeline enabled for generated media")
+            )
+
         if reusable_voice_preview:
             # 试听缓存只存在当前 Streamlit 会话。提交前把音频写入目标任务目录，
             # 后台线程随后只读取任务自己的文件；即使页面 rerun、浏览器关闭或

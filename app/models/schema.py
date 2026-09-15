@@ -106,6 +106,25 @@ class VideoParams(BaseModel):
     video_subject: str
     video_script: str = ""  # Script used to generate the video
     video_terms: Optional[str | list] = None  # Keywords used to generate the video
+    # Optional ComfyUI T2V prompt-assembly fields. Scene Prompts take precedence
+    # over video_terms for comfyui_video; Subject Anchors are expanded before the
+    # global ComfyUI prompt template is applied.
+    comfyui_video_subject_anchors: str = Field(default="", max_length=12000)
+    comfyui_video_scene_prompts: str = Field(default="", max_length=24000)
+    # Optional locked shot windows created by the audio-first Visual Shot Plan.
+    # Timeline-aware AI image sources consume one visual prompt per window while
+    # legacy material sources ignore this field and preserve existing behavior.
+    media_shot_timeline: Optional[List[dict[str, Any]]] = None
+    # Material-source strategy. Missing historical values default to single-source
+    # behavior; hybrid mode is an explicit opt-in that requires a validated Media Plan.
+    media_source_mode: Literal["single", "hybrid"] = "single"
+    # Media Planner settings and explicit per-shot provider decisions. The planner can
+    # be previewed in either mode, but only media_source_mode="hybrid" attaches the plan
+    # from the WebUI to generation.
+    media_planning_mode: str = "automatic"
+    default_ai_image_provider: str = "comfyui_t2i"
+    default_ai_video_provider: str = "comfyui_video"
+    media_plan: Optional[List[dict[str, Any]]] = None
     video_aspect: Optional[VideoAspect] = VideoAspect.portrait.value
     video_fit_mode: VideoFitMode = VideoFitMode.cover
     video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random.value

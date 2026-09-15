@@ -26,6 +26,7 @@ from app.services import (
     sonilo,
     subtitle,
     task_artifacts,
+    timeline_media,
     twelvelabs,
     video,
     volcengine_seedance,
@@ -311,26 +312,73 @@ def generate_script(task_id, params):
 
 def generate_terms(task_id, params, video_script):
     logger.info("\n\n## generating video terms")
-    video_terms = params.video_terms
-    if not video_terms:
-        # 开启素材按文案顺序匹配后，关键词本身也必须按脚本叙事顺序生成；
-        # 否则后续即使顺序下载和顺序拼接，也只能复用一组全局主题词，
-        # 无法改善“后面内容的画面提前出现”的问题。
-        video_terms = llm.generate_terms(
-            video_subject=params.video_subject,
-            video_script=utils.remove_pause_tags(video_script),
-            amount=8 if params.match_materials_to_script else 5,
-            match_script_order=params.match_materials_to_script,
+
+    # ComfyUI Video can use task-specific Scene Prompts with reusable Subject Anchors.
+    # Scene Prompts take precedence over the legacy/general Video Keywords field.
+    scene_prompts = str(
+        getattr(params, "comfyui_video_scene_prompts", "") or ""
+    ).strip()
+    hybrid_media_plan = bool(
+        getattr(params, "media_plan", None) and getattr(params, "media_shot_timeline", None)
+    )
+    video_source = getattr(params, "video_source", "")
+    if (
+        getattr(params, "video_source", "") == "comfyui_video"
+        and scene_prompts
+        and not hybrid_media_plan
+    ):
+        try:
+            video_terms = material.expand_comfyui_video_scene_prompts(
+                scene_prompts=scene_prompts,
+                subject_anchors=getattr(
+                    params, "comfyui_video_subject_anchors", ""
+                ),
+            )
+        except ValueError as exc:
+            _mark_task_failed(task_id, "terms", str(exc))
+            return None
+        logger.debug(
+            "ComfyUI Video expanded scene prompts: "
+            f"{utils.to_json(video_terms)}"
         )
     else:
-        if isinstance(video_terms, str):
-            video_terms = [term.strip() for term in re.split(r"[,，]", video_terms)]
-        elif isinstance(video_terms, list):
-            video_terms = [term.strip() for term in video_terms]
+        video_terms = params.video_terms
+        if not video_terms:
+            # 开启素材按文案顺序匹配后，关键词本身也必须按脚本叙事顺序生成；
+            # 否则后续即使顺序下载和顺序拼接，也只能复用一组全局主题词，
+            # 无法改善“后面内容的画面提前出现”的问题。
+            video_terms = llm.generate_terms(
+                video_subject=params.video_subject,
+                video_script=utils.remove_pause_tags(video_script),
+                amount=8 if params.match_materials_to_script else 5,
+                match_script_order=params.match_materials_to_script,
+                visual_prompt_mode=llm.should_generate_visual_prompts(
+                    video_source
+                ),
+            )
         else:
-            raise ValueError("video_terms must be a string or a list of strings.")
+            if isinstance(video_terms, str):
+                # New format: one complete visual prompt per line. Commas inside a line
+                # belong to that prompt and must not split it into unrelated fragments.
+                # Legacy single-line comma-separated keywords remain supported.
+                if "\n" in video_terms or "\r" in video_terms:
+                    video_terms = [
+                        term.strip()
+                        for term in video_terms.splitlines()
+                        if term.strip()
+                    ]
+                else:
+                    video_terms = [
+                        term.strip()
+                        for term in re.split(r"[,，]", video_terms)
+                        if term.strip()
+                    ]
+            elif isinstance(video_terms, list):
+                video_terms = [term.strip() for term in video_terms if term.strip()]
+            else:
+                raise ValueError("video_terms must be a string or a list of strings.")
 
-        logger.debug(f"video terms: {utils.to_json(video_terms)}")
+            logger.debug(f"video terms: {utils.to_json(video_terms)}")
 
     if not video_terms:
         _mark_task_failed(
@@ -340,9 +388,21 @@ def generate_terms(task_id, params, video_script):
         )
         return None
 
-    # 可选的 TwelveLabs Marengo 语义重排：未启用时返回原顺序，无任何副作用。
-    # 顺序匹配模式下关键词顺序本身就是脚本叙事顺序，必须保持原样，故跳过。
-    if not params.match_materials_to_script:
+    # Scene Prompts and locked audio-first shot prompts are explicit narrative
+    # orders. Never semantically rerank them. Other providers retain the existing
+    # optional TwelveLabs behavior.
+    locked_timeline_order = bool(
+        getattr(params, "media_shot_timeline", None)
+        and (
+            getattr(params, "media_plan", None)
+            or timeline_media.is_timeline_aware_generated_source(video_source)
+        )
+    )
+    if (
+        video_source != "comfyui_video"
+        and not locked_timeline_order
+        and not params.match_materials_to_script
+    ):
         video_terms = twelvelabs.rerank_terms_by_subject(
             video_subject=params.video_subject,
             search_terms=video_terms,
@@ -567,6 +627,69 @@ def generate_audio(
         return custom_audio_file, audio_duration, None
 
 
+
+def _prepare_locked_media_shot_timeline(
+    task_id: str,
+    params,
+    video_terms,
+    audio_file: str,
+) -> list[dict] | None:
+    """Validate a WebUI audio-first shot timeline against the real narration file.
+
+    Legacy sources ignore the optional field entirely. Timeline-aware generated media
+    sources fail before any paid/local inference when the prompt count or timing no
+    longer matches the narration, preventing silent scene drift.
+    """
+    raw_timeline = getattr(params, "media_shot_timeline", None)
+    raw_media_plan = getattr(params, "media_plan", None) or None
+    if not raw_timeline:
+        return None
+    if not raw_media_plan and not timeline_media.is_timeline_aware_generated_source(
+        getattr(params, "video_source", None)
+    ):
+        return None
+
+    actual_audio_duration = voice.get_audio_duration(audio_file)
+    if actual_audio_duration <= 0:
+        raise timeline_media.TimelineMediaError(
+            "could not measure narration audio for the locked media shot timeline"
+        )
+
+    normalized = timeline_media.normalize_locked_shot_timeline(
+        raw_timeline,
+        audio_duration=actual_audio_duration,
+        max_clip_duration=getattr(params, "video_clip_duration", 5),
+        expected_count=len(video_terms or []),
+    )
+    if raw_media_plan:
+        params.media_plan = timeline_media.normalize_hybrid_media_plan(
+            raw_media_plan,
+            normalized,
+            video_terms or [],
+            audio_duration=actual_audio_duration,
+            max_clip_duration=getattr(params, "video_clip_duration", 5),
+        )
+
+    logger.info(
+        "validated locked media shot timeline: "
+        f"task_id={task_id}, shots={len(normalized)}, "
+        f"audio={actual_audio_duration:.3f}s, "
+        f"hybrid={bool(raw_media_plan)}"
+    )
+    try:
+        task_artifacts.patch_script_data(
+            task_id,
+            media_shot_timeline=normalized,
+            media_plan=getattr(params, "media_plan", None),
+        )
+    except Exception as exc:
+        logger.warning(
+            "failed to persist normalized media shot timeline: "
+            f"task_id={task_id}, error={type(exc).__name__}, detail={exc}"
+        )
+    return normalized
+
+
 def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     """
     Generate subtitle for the video script.
@@ -642,6 +765,32 @@ def get_video_materials(
     audio_duration,
     loomloom_video_request: loomloom.LoomLoomConfirmedVideoRequest | None = None,
 ):
+    hybrid_media_plan = getattr(params, "media_plan", None) or None
+    hybrid_timeline = getattr(params, "media_shot_timeline", None) or None
+    if hybrid_media_plan and hybrid_timeline:
+        logger.info("\n\n## generating hybrid timeline media")
+        try:
+            downloaded_videos = material.download_videos(
+                task_id=task_id,
+                search_terms=video_terms,
+                source=params.video_source,
+                video_aspect=params.video_aspect,
+                video_concat_mode=VideoConcatMode.sequential,
+                audio_duration=float(hybrid_timeline[-1]["end"]),
+                max_clip_duration=params.video_clip_duration,
+                match_script_order=True,
+                clip_speed=params.video_clip_speed,
+                shot_timeline=hybrid_timeline,
+                media_plan=hybrid_media_plan,
+            )
+        except timeline_media.TimelineMediaError as exc:
+            _mark_task_failed(task_id, "materials", str(exc))
+            return None
+        except material.ComfyUIVideoError as exc:
+            _mark_task_failed(task_id, "materials", str(exc))
+            return None
+        return downloaded_videos or None
+
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
@@ -718,6 +867,17 @@ def get_video_materials(
             return None
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
+        # A locked audio-first timeline already describes one complete visual
+        # realization of the narration. Generate exactly one material per shot;
+        # multiple output videos may reuse that same generated material set.
+        shot_timeline = getattr(params, "media_shot_timeline", None) or None
+        if shot_timeline and timeline_media.is_timeline_aware_generated_source(
+            params.video_source
+        ):
+            material_audio_duration = float(shot_timeline[-1]["end"])
+        else:
+            material_audio_duration = audio_duration * params.video_count
+
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
         # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
         try:
@@ -731,10 +891,27 @@ def get_video_materials(
                     if params.match_materials_to_script
                     else params.video_concat_mode
                 ),
-                audio_duration=audio_duration * params.video_count,
+                audio_duration=material_audio_duration,
                 max_clip_duration=params.video_clip_duration,
                 match_script_order=params.match_materials_to_script,
+                clip_speed=params.video_clip_speed,
+                shot_timeline=shot_timeline,
+                media_plan=getattr(params, "media_plan", None),
             )
+        except timeline_media.TimelineMediaError as exc:
+            _mark_task_failed(
+                task_id,
+                "materials",
+                str(exc),
+            )
+            return None
+        except material.ComfyUIVideoError as exc:
+            _mark_task_failed(
+                task_id,
+                "materials",
+                str(exc),
+            )
+            return None
         except volcengine_seedance.VolcEngineSeedanceError as exc:
             # 未确认状态和已生成但下载失败都对应一个可在方舟控制台恢复的远端
             # 任务。统一从异常携带的 task_id 写入失败状态，避免不同异常分支
@@ -860,6 +1037,38 @@ def _get_material_source_groups(task_id: str, video_paths: list[str]) -> dict[st
 def generate_final_videos(
     task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
 ):
+    effective_clip_duration = params.video_clip_duration
+    locked_timeline = getattr(params, "media_shot_timeline", None) or None
+    timeline_generated_mode = bool(
+        locked_timeline
+        and (
+            getattr(params, "media_plan", None)
+            or timeline_media.is_timeline_aware_generated_source(params.video_source)
+        )
+    )
+
+    if (
+        not timeline_generated_mode
+        and params.video_source in {"comfyui_t2i", "comfyui_mage"}
+        and downloaded_videos
+    ):
+        effective_clip_duration = material.calculate_comfyui_t2i_clip_duration(
+            audio_duration,
+            len(downloaded_videos),
+        )
+        logger.info(
+            "ComfyUI T2I final automatic timing: "
+            f"audio={float(audio_duration):.2f}s, "
+            f"images={len(downloaded_videos)}, "
+            f"duration_per_image={effective_clip_duration:.3f}s"
+        )
+    elif timeline_generated_mode:
+        logger.info(
+            "timeline-aware final timing enabled: "
+            f"source={'hybrid_media_plan' if getattr(params, 'media_plan', None) else params.video_source}, "
+            f"shots={len(locked_timeline)}, "
+            f"max_clip={float(params.video_clip_duration):.3f}s"
+        )
     final_video_paths = []
     combined_video_paths = []
     warnings = []
@@ -904,19 +1113,33 @@ def generate_final_videos(
             }
             if allocate_batch_materials else {}
         )
-        video.combine_videos(
-            combined_video_path=combined_video_path,
-            video_paths=downloaded_videos,
-            audio_file=audio_file,
-            video_aspect=params.video_aspect,
-            video_fit_mode=params.video_fit_mode,
-            video_concat_mode=video_concat_mode,
-            video_transition_mode=video_transition_mode,
-            max_clip_duration=params.video_clip_duration,
-            threads=params.n_threads,
-            clip_speed=params.video_clip_speed,
-            **batch_options,
-        )
+        if timeline_generated_mode:
+            video.combine_videos_with_timeline(
+                combined_video_path=combined_video_path,
+                video_paths=downloaded_videos,
+                audio_file=audio_file,
+                shot_timeline=locked_timeline,
+                video_aspect=params.video_aspect,
+                video_fit_mode=params.video_fit_mode,
+                video_transition_mode=video_transition_mode,
+                max_clip_duration=params.video_clip_duration,
+                threads=params.n_threads,
+                clip_speed=params.video_clip_speed,
+            )
+        else:
+            video.combine_videos(
+                combined_video_path=combined_video_path,
+                video_paths=downloaded_videos,
+                audio_file=audio_file,
+                video_aspect=params.video_aspect,
+                video_fit_mode=params.video_fit_mode,
+                video_concat_mode=video_concat_mode,
+                video_transition_mode=video_transition_mode,
+                max_clip_duration=effective_clip_duration,
+                threads=params.n_threads,
+                clip_speed=params.video_clip_speed,
+                **batch_options,
+            )
         if allocate_batch_materials:
             selected_sources = list(dict.fromkeys(used_video_paths))
             reused_sources = [file for file in selected_sources if source_usage.get(file, 0)]
@@ -1361,8 +1584,54 @@ def _run_pipeline(
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
 
+    hybrid_media_plan_requested = bool(
+        getattr(params, "media_plan", None) and getattr(params, "media_shot_timeline", None)
+    )
+    explicit_hybrid_mode = (
+        str(getattr(params, "media_source_mode", "single") or "single").strip()
+        == "hybrid"
+    )
     if (
         stop_at in {"materials", "video"}
+        and explicit_hybrid_mode
+        and not hybrid_media_plan_requested
+    ):
+        return _mark_task_failed(
+            task_id,
+            "preflight",
+            "Media Plan (Mixed) requires both a validated media_plan and media_shot_timeline",
+        )
+
+    if stop_at in {"materials", "video"} and hybrid_media_plan_requested:
+        planned_providers = timeline_media.hybrid_media_plan_providers(params.media_plan)
+        unsupported = planned_providers - timeline_media.HYBRID_MEDIA_PROVIDERS
+        if unsupported:
+            return _mark_task_failed(
+                task_id,
+                "preflight",
+                "hybrid media plan contains unsupported providers: "
+                + ", ".join(sorted(unsupported)),
+            )
+        app_config = config.snapshot_config_with_pending(config.app)
+        if "openai_image" in planned_providers and not material.is_openai_image_enabled(app_config):
+            return _mark_task_failed(
+                task_id, "preflight",
+                "hybrid media plan requires a configured OpenAI image source",
+            )
+        if "comfyui_t2i" in planned_providers and not material.is_comfyui_t2i_enabled(app_config):
+            return _mark_task_failed(
+                task_id, "preflight",
+                "hybrid media plan requires a configured ComfyUI T2I workflow",
+            )
+        if "comfyui_video" in planned_providers and not material.is_comfyui_video_enabled(app_config):
+            return _mark_task_failed(
+                task_id, "preflight",
+                "hybrid media plan requires a configured ComfyUI Video workflow",
+            )
+
+    if (
+        stop_at in {"materials", "video"}
+        and not hybrid_media_plan_requested
         and params.video_source == "volcengine_seedance"
         and not volcengine_seedance.is_enabled()
     ):
@@ -1374,6 +1643,7 @@ def _run_pipeline(
 
     if (
         stop_at in {"materials", "video"}
+        and not hybrid_media_plan_requested
         and params.video_source == "ofox"
         and not ofox.is_enabled()
     ):
@@ -1385,6 +1655,7 @@ def _run_pipeline(
 
     if (
         stop_at in {"materials", "video"}
+        and not hybrid_media_plan_requested
         and params.video_source == "metaso_minimax"
         and not metaso_minimax.is_enabled()
     ):
@@ -1396,6 +1667,7 @@ def _run_pipeline(
 
     if (
         stop_at in {"materials", "video"}
+        and not hybrid_media_plan_requested
         and params.video_source == "openai_image"
         and not material.is_openai_image_enabled(
             config.snapshot_config_with_pending(config.app)
@@ -1407,6 +1679,35 @@ def _run_pipeline(
             "OpenAI image source requires openai_image_base_url and "
             "openai_image_model in config.toml (openai_image_api_keys is "
             "optional for local gateways that need no auth)",
+        )
+
+    if (
+        stop_at in {"materials", "video"}
+        and not hybrid_media_plan_requested
+        and params.video_source in {"comfyui_t2i", "comfyui_mage"}
+        and not material.is_comfyui_t2i_enabled(
+            config.snapshot_config_with_pending(config.app)
+        )
+    ):
+        return _mark_task_failed(
+            task_id,
+            "preflight",
+            "ComfyUI T2I requires a ComfyUI base URL and exported API workflow path "
+            "(legacy comfyui_mage_* settings remain supported)",
+        )
+
+    if (
+        stop_at in {"materials", "video"}
+        and not hybrid_media_plan_requested
+        and params.video_source == "comfyui_video"
+        and not material.is_comfyui_video_enabled(
+            config.snapshot_config_with_pending(config.app)
+        )
+    ):
+        return _mark_task_failed(
+            task_id,
+            "preflight",
+            "ComfyUI Video requires a ComfyUI base URL and exported T2V API workflow path",
         )
 
     # 只有完整成片流程需要视频配乐供应商。尽早阻止缺少 Key 的完整任务，避免
@@ -1480,7 +1781,7 @@ def _run_pipeline(
 
     # 2. Generate terms
     video_terms = ""
-    if params.video_source != "local":
+    if params.video_source != "local" or hybrid_media_plan_requested:
         video_terms = generate_terms(task_id, params, video_script)
         if not video_terms:
             return _mark_task_failed(
@@ -1524,6 +1825,20 @@ def _run_pipeline(
             audio_file=audio_file,
         )
         return {"audio_file": audio_file, "audio_duration": audio_duration}
+
+    # Audio-first locked timing is validated only after the real narration file
+    # exists. Legacy sources ignore the optional field and preserve old behavior.
+    try:
+        locked_timeline = _prepare_locked_media_shot_timeline(
+            task_id,
+            params,
+            video_terms,
+            audio_file,
+        )
+    except timeline_media.TimelineMediaError as exc:
+        return _mark_task_failed(task_id, "timeline", str(exc))
+    if locked_timeline is not None:
+        params.media_shot_timeline = locked_timeline
 
     # 4. Generate subtitle
     subtitle_path = generate_subtitle(

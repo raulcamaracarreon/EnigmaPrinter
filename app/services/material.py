@@ -1,8 +1,11 @@
 import base64
+import copy
 import io
+import json
 import math
 import os
 import random
+import re
 import threading
 import time
 import uuid
@@ -22,6 +25,7 @@ from app.services import (
     metaso_minimax,
     ofox,
     task_artifacts,
+    timeline_media,
     video,
     volcengine_seedance,
 )
@@ -1365,6 +1369,7 @@ def _request_openai_image(endpoint: str, payload: dict) -> tuple[bytes | None, s
 def _save_openai_image_file(
     image_bytes: bytes,
     save_dir: str,
+    filename_prefix: str = "openai-image",
 ) -> tuple[str, int, int]:
     """
     把生成结果规范成 PNG 落盘，返回 (路径, 宽, 高)。
@@ -1378,7 +1383,15 @@ def _save_openai_image_file(
     elif not os.path.isdir(save_dir):
         os.makedirs(save_dir, exist_ok=True)
 
-    image_path = os.path.join(save_dir, f"openai-image-{uuid.uuid4().hex[:12]}.png")
+    safe_prefix = "".join(
+        character
+        for character in str(filename_prefix or "generated-image")
+        if character.isalnum() or character in {"-", "_"}
+    ).strip("-_") or "generated-image"
+    image_path = os.path.join(
+        save_dir,
+        f"{safe_prefix}-{uuid.uuid4().hex[:12]}.png",
+    )
 
     # 图片解码失败可以降级为“跳过当前关键词”，但目录权限、磁盘空间和文件
     # 写入失败必须继续抛出，否则按需生成循环会在本地无法保存文件时继续创建
@@ -1466,14 +1479,16 @@ def generate_images_openai(
     return [item]
 
 
-def _render_openai_image_video(image_path: str, clip_duration: int) -> str:
+def _render_openai_image_video(
+    image_path: str, clip_duration: float, motion: str | None = None
+) -> str:
     """
     把生成的图片渲染成 mp4 片段，复用 local 素材的"图片 → 动态片段"管线。
 
     渲染失败按素材源约定返回空字符串，由调用方跳过该图片继续。
     """
     try:
-        return video.render_image_zoom_video(image_path, clip_duration)
+        return video.render_image_zoom_video(image_path, clip_duration, motion=motion)
     except Exception as e:
         logger.error(
             "failed to render generated image as a video clip: "
@@ -1559,6 +1574,1881 @@ def _download_videos_openai_image_on_demand(
 
     logger.success(f"generated and rendered {len(video_paths)} image materials")
     _persist_material_sources(task_id, material_sources)
+    return video_paths
+
+COMFYUI_T2I_DEFAULT_BASE_URL = "http://127.0.0.1:8000"
+# Backward-compatible alias for existing local configs and older WebUI code.
+COMFYUI_MAGE_DEFAULT_BASE_URL = COMFYUI_T2I_DEFAULT_BASE_URL
+COMFYUI_T2I_REQUEST_TIMEOUT = (10, 60)
+COMFYUI_T2I_POLL_INTERVAL_SECONDS = 1.0
+COMFYUI_T2I_MAX_WAIT_SECONDS = 300
+COMFYUI_T2I_RENDER_FPS = 30
+COMFYUI_T2I_TIMING_SAFETY_SECONDS = 0.10
+
+
+def _comfyui_t2i_config_value(
+    key: str,
+    legacy_key: str,
+    default: str = "",
+    *,
+    app_config: dict | None = None,
+) -> str:
+    """Read the generic ComfyUI T2I setting, falling back to legacy Mage keys."""
+    app_config = config.app if app_config is None else app_config
+    value = app_config.get(key)
+    if value in (None, ""):
+        value = app_config.get(legacy_key, default)
+    if value in (None, ""):
+        value = default
+    return str(value).strip()
+
+
+def is_comfyui_t2i_enabled(app_config: dict | None = None) -> bool:
+    base_url = _comfyui_t2i_config_value(
+        "comfyui_t2i_base_url",
+        "comfyui_mage_base_url",
+        COMFYUI_T2I_DEFAULT_BASE_URL,
+        app_config=app_config,
+    )
+    workflow_path = _comfyui_t2i_config_value(
+        "comfyui_t2i_workflow_path",
+        "comfyui_mage_workflow_path",
+        app_config=app_config,
+    )
+    return bool(base_url and workflow_path)
+
+
+def is_comfyui_mage_enabled(app_config: dict | None = None) -> bool:
+    """Backward-compatible name retained for existing task/source identifiers."""
+    return is_comfyui_t2i_enabled(app_config)
+
+
+def _comfyui_t2i_base_url() -> str:
+    return _comfyui_t2i_config_value(
+        "comfyui_t2i_base_url",
+        "comfyui_mage_base_url",
+        COMFYUI_T2I_DEFAULT_BASE_URL,
+    ).rstrip("/")
+
+
+def _comfyui_t2i_workflow_path() -> str:
+    workflow_path = _comfyui_t2i_config_value(
+        "comfyui_t2i_workflow_path",
+        "comfyui_mage_workflow_path",
+    )
+    if not workflow_path:
+        raise ValueError(
+            "\n\n##### comfyui_t2i_workflow_path is not set #####\n\n"
+            f"Please set it in the config.toml file: {config.config_file}\n"
+        )
+    if not os.path.isfile(workflow_path):
+        raise FileNotFoundError(f"ComfyUI T2I workflow file not found: {workflow_path}")
+    return workflow_path
+
+
+def _comfyui_t2i_size(video_aspect: VideoAspect) -> tuple[int, int]:
+    """Map MoneyPrinterTurbo aspect ratio directly to a sensible local T2I size."""
+    aspect = VideoAspect(video_aspect)
+    if aspect == VideoAspect.portrait:
+        return 720, 1280
+    if aspect == VideoAspect.landscape:
+        return 1280, 720
+    if aspect == VideoAspect.square:
+        return 1024, 1024
+    return 1024, 1024
+
+
+def _comfyui_t2i_prompt(search_term: str) -> str:
+    template = _comfyui_t2i_config_value(
+        "comfyui_t2i_prompt_template",
+        "comfyui_mage_prompt_template",
+    )
+    if not template or "{term}" not in template:
+        return search_term
+    return template.replace("{term}", search_term)
+
+
+def _comfyui_t2i_negative_prompt() -> str:
+    return _comfyui_t2i_config_value(
+        "comfyui_t2i_negative_prompt",
+        "comfyui_mage_negative_prompt",
+    )
+
+
+def _load_comfyui_t2i_workflow() -> dict:
+    workflow_path = _comfyui_t2i_workflow_path()
+    with open(workflow_path, "r", encoding="utf-8") as file:
+        data = json.load(file)
+    if not isinstance(data, dict):
+        raise ValueError("ComfyUI T2I workflow must be a JSON object")
+    return data
+
+
+def _workflow_input_reference_node_id(value: Any) -> str | None:
+    if isinstance(value, (list, tuple)) and value:
+        return str(value[0])
+    return None
+
+
+def _find_comfyui_sampler_node(workflow: dict) -> tuple[str, dict] | tuple[None, None]:
+    # Prefer samplers that expose both conditioning inputs, then fall back to any
+    # node carrying a seed/noise_seed input.
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if isinstance(inputs, dict) and "positive" in inputs and "negative" in inputs:
+            return str(node_id), node
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if isinstance(inputs, dict) and ("seed" in inputs or "noise_seed" in inputs):
+            return str(node_id), node
+    return None, None
+
+
+def _prepare_comfyui_t2i_workflow(
+    search_term: str,
+    width: int,
+    height: int,
+) -> dict:
+    """
+    Adapt an exported ComfyUI API workflow without depending on fixed Mage node IDs.
+
+    Supported patterns include Mage Flow's combined prompt/negative/size node and
+    conventional T2I workflows where KSampler references positive/negative text
+    encoders plus an EmptyLatent-style width/height node.
+    """
+    workflow = copy.deepcopy(_load_comfyui_t2i_workflow())
+    positive_prompt = _comfyui_t2i_prompt(search_term)
+    negative_prompt = _comfyui_t2i_negative_prompt()
+
+    prompt_updated = False
+    negative_updated = False
+    size_updated = False
+    seed_updated = False
+    prefix_updated = False
+
+    # Mage Flow and similar custom nodes keep prompt, negative prompt and latent
+    # dimensions together. Detect this structurally instead of by node ID.
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        if "prompt" in inputs:
+            inputs["prompt"] = positive_prompt
+            prompt_updated = True
+        if "negative_prompt" in inputs:
+            inputs["negative_prompt"] = negative_prompt
+            negative_updated = True
+        if "width" in inputs and "height" in inputs and (
+            "prompt" in inputs or "latent" in str(node.get("class_type", "")).lower()
+        ):
+            inputs["width"] = int(width)
+            inputs["height"] = int(height)
+            size_updated = True
+
+    sampler_id, sampler_node = _find_comfyui_sampler_node(workflow)
+    sampler_inputs = (
+        sampler_node.get("inputs", {}) if isinstance(sampler_node, dict) else {}
+    )
+
+    # Conventional ComfyUI workflows usually connect KSampler positive/negative
+    # directly to CLIPTextEncode nodes. Follow those references so the two prompts
+    # are never guessed by node order.
+    if not prompt_updated and isinstance(sampler_inputs, dict):
+        positive_node_id = _workflow_input_reference_node_id(
+            sampler_inputs.get("positive")
+        )
+        positive_node = workflow.get(positive_node_id or "")
+        if isinstance(positive_node, dict):
+            positive_inputs = positive_node.get("inputs")
+            if isinstance(positive_inputs, dict):
+                if "text" in positive_inputs:
+                    positive_inputs["text"] = positive_prompt
+                    prompt_updated = True
+                elif "prompt" in positive_inputs:
+                    positive_inputs["prompt"] = positive_prompt
+                    prompt_updated = True
+
+    if not negative_updated and isinstance(sampler_inputs, dict):
+        negative_node_id = _workflow_input_reference_node_id(
+            sampler_inputs.get("negative")
+        )
+        negative_node = workflow.get(negative_node_id or "")
+        if isinstance(negative_node, dict):
+            negative_inputs = negative_node.get("inputs")
+            if isinstance(negative_inputs, dict):
+                if "text" in negative_inputs:
+                    negative_inputs["text"] = negative_prompt
+                    negative_updated = True
+                elif "negative_prompt" in negative_inputs:
+                    negative_inputs["negative_prompt"] = negative_prompt
+                    negative_updated = True
+
+    # If size was not colocated with the prompt node, prefer latent/image-size nodes.
+    if not size_updated:
+        preferred_size_nodes = []
+        fallback_size_nodes = []
+        for node in workflow.values():
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs")
+            if not isinstance(inputs, dict) or "width" not in inputs or "height" not in inputs:
+                continue
+            class_type = str(node.get("class_type", "")).lower()
+            if "latent" in class_type or "resolution" in class_type:
+                preferred_size_nodes.append(inputs)
+            else:
+                fallback_size_nodes.append(inputs)
+        size_inputs = (
+            preferred_size_nodes[0]
+            if preferred_size_nodes
+            else (fallback_size_nodes[0] if fallback_size_nodes else None)
+        )
+        if size_inputs is not None:
+            size_inputs["width"] = int(width)
+            size_inputs["height"] = int(height)
+            size_updated = True
+
+    # Randomize the first sampler/noise seed we can identify.
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        if "seed" in inputs:
+            inputs["seed"] = random.randint(1, 2**63 - 1)
+            seed_updated = True
+            break
+        if "noise_seed" in inputs:
+            inputs["noise_seed"] = random.randint(1, 2**63 - 1)
+            seed_updated = True
+            break
+
+    # SaveImage/SaveImageAdvanced both commonly expose filename_prefix. The output
+    # parser does not depend on this, but a unique prefix makes ComfyUI history and
+    # the output directory much easier to inspect.
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if isinstance(inputs, dict) and "filename_prefix" in inputs:
+            inputs["filename_prefix"] = f"mpt_comfyui_{uuid.uuid4().hex[:8]}"
+            prefix_updated = True
+            break
+
+    if not prompt_updated:
+        raise ValueError(
+            "Could not identify a prompt input in the ComfyUI T2I workflow. "
+            "Use an API workflow where the sampler references a text encoder, "
+            "or a node exposing a prompt input."
+        )
+    if not size_updated:
+        raise ValueError(
+            "Could not identify width/height inputs in the ComfyUI T2I workflow. "
+            "Export a workflow with an explicit latent/image size node."
+        )
+
+    if negative_prompt and not negative_updated:
+        logger.warning(
+            "ComfyUI T2I negative prompt was configured but no compatible negative "
+            "conditioning input was detected; continuing without injecting it."
+        )
+    if not seed_updated:
+        logger.warning(
+            "ComfyUI T2I workflow has no detectable seed/noise_seed input; "
+            "the workflow's existing seed behavior will be used."
+        )
+    if not prefix_updated:
+        logger.debug(
+            "ComfyUI T2I workflow has no filename_prefix input; output discovery "
+            "will rely on ComfyUI history."
+        )
+
+    return workflow
+
+
+def _extract_first_comfyui_image(output_payload: dict) -> dict | None:
+    if not isinstance(output_payload, dict):
+        return None
+
+    for node_output in output_payload.values():
+        if not isinstance(node_output, dict):
+            continue
+        images = node_output.get("images")
+        if isinstance(images, list) and images:
+            first = images[0]
+            if isinstance(first, dict) and first.get("filename"):
+                return first
+    return None
+
+
+def _request_comfyui_t2i_image(
+    search_term: str,
+    width: int,
+    height: int,
+) -> bytes:
+    base_url = _comfyui_t2i_base_url()
+    workflow = _prepare_comfyui_t2i_workflow(search_term, width, height)
+
+    submit_response = requests.post(
+        f"{base_url}/prompt",
+        json={"prompt": workflow},
+        proxies=config.proxy,
+        verify=_get_tls_verify(),
+        timeout=COMFYUI_T2I_REQUEST_TIMEOUT,
+    )
+    if submit_response.status_code >= 400:
+        raise ValueError(
+            f"ComfyUI prompt submission failed: HTTP {submit_response.status_code} "
+            f"{str(submit_response.text)[:300]}"
+        )
+
+    submit_body = submit_response.json()
+    prompt_id = str(submit_body.get("prompt_id") or "").strip()
+    if not prompt_id:
+        raise ValueError(f"ComfyUI did not return prompt_id: {submit_body}")
+
+    deadline = time.time() + COMFYUI_T2I_MAX_WAIT_SECONDS
+    last_payload = None
+
+    while time.time() < deadline:
+        history_response = requests.get(
+            f"{base_url}/history/{prompt_id}",
+            proxies=config.proxy,
+            verify=_get_tls_verify(),
+            timeout=(10, 30),
+        )
+        if history_response.status_code >= 400:
+            raise ValueError(
+                f"ComfyUI history request failed: HTTP {history_response.status_code} "
+                f"{str(history_response.text)[:300]}"
+            )
+
+        history_body = history_response.json()
+        last_payload = history_body
+
+        history_item = None
+        if isinstance(history_body, dict):
+            if prompt_id in history_body and isinstance(history_body[prompt_id], dict):
+                history_item = history_body[prompt_id]
+            elif "outputs" in history_body:
+                history_item = history_body
+
+        if isinstance(history_item, dict):
+            image_info = _extract_first_comfyui_image(history_item.get("outputs", {}))
+            if image_info:
+                view_response = requests.get(
+                    f"{base_url}/view",
+                    params={
+                        "filename": image_info.get("filename", ""),
+                        "subfolder": image_info.get("subfolder", ""),
+                        "type": image_info.get("type", "output"),
+                    },
+                    proxies=config.proxy,
+                    verify=_get_tls_verify(),
+                    timeout=(10, 120),
+                )
+                if view_response.status_code >= 400:
+                    raise ValueError(
+                        f"ComfyUI image download failed: HTTP {view_response.status_code} "
+                        f"{str(view_response.text)[:300]}"
+                    )
+                return view_response.content
+
+        time.sleep(COMFYUI_T2I_POLL_INTERVAL_SECONDS)
+
+    raise TimeoutError(
+        f"Timed out waiting for ComfyUI T2I image output. Last payload: {last_payload}"
+    )
+
+
+def calculate_comfyui_t2i_clip_duration(
+    audio_duration: float,
+    image_count: int,
+) -> float:
+    """
+    Return a 30-fps-aligned clip duration that covers the narration plus the
+    combiner's 0.10 s safety margin without needing to loop the first image.
+
+    Rounding upward to a frame boundary matters because MoviePy/FFmpeg otherwise
+    shortens fractional clip durations such as 4.789 s when rendering at 30 fps.
+    """
+    try:
+        duration = float(audio_duration)
+        count = int(image_count)
+    except (TypeError, ValueError):
+        return 0.0
+    if duration <= 0 or count <= 0:
+        return 0.0
+
+    seconds_per_image = (
+        duration + COMFYUI_T2I_TIMING_SAFETY_SECONDS
+    ) / count
+    return (
+        math.ceil(seconds_per_image * COMFYUI_T2I_RENDER_FPS)
+        / COMFYUI_T2I_RENDER_FPS
+    )
+
+
+def generate_images_comfyui_t2i(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    save_dir: str = "",
+) -> List[MaterialInfo]:
+    aspect = VideoAspect(video_aspect)
+    clip_duration = max(int(minimum_duration), 1)
+    width, height = _comfyui_t2i_size(aspect)
+
+    logger.info(
+        f"generating image via ComfyUI T2I: term={search_term!r}, size={width}x{height}"
+    )
+
+    try:
+        image_bytes = _request_comfyui_t2i_image(
+            search_term=search_term,
+            width=width,
+            height=height,
+        )
+        image_path, actual_width, actual_height = _save_openai_image_file(
+            image_bytes,
+            save_dir,
+            filename_prefix="comfyui-image",
+        )
+    except Exception as exc:
+        logger.error(
+            "comfyui t2i image generation failed: "
+            f"term={search_term!r}, error={type(exc).__name__}, detail={exc}"
+        )
+        return []
+
+    item = MaterialInfo()
+    item.provider = "comfyui_t2i"
+    item.url = image_path
+    item.duration = clip_duration
+    item.source_info = {
+        "provider": "comfyui_t2i",
+        "search_term": search_term,
+        "rendition": {
+            "id": None,
+            "width": actual_width,
+            "height": actual_height,
+        },
+    }
+    return [item]
+
+
+def _download_videos_comfyui_t2i_on_demand(
+    *,
+    task_id: str,
+    search_terms: List[str],
+    video_aspect: VideoAspect,
+    audio_duration: float,
+    max_clip_duration: int,
+    material_directory: str,
+) -> List[str]:
+    if not material_directory:
+        material_directory = utils.task_dir(task_id)
+
+    video_paths: List[str] = []
+    material_sources: list[dict[str, Any]] = []
+    total_duration = 0.0
+
+    try:
+        required_duration = float(audio_duration)
+    except (TypeError, ValueError):
+        required_duration = 0.0
+
+    if required_duration <= 0:
+        logger.warning(
+            "skip ComfyUI T2I generation because required audio duration is "
+            f"not positive: duration={audio_duration}"
+        )
+        _persist_material_sources(task_id, material_sources)
+        return video_paths
+
+    valid_terms = [
+        term.strip()
+        for term in search_terms
+        if isinstance(term, str) and term.strip()
+    ]
+    if not valid_terms:
+        logger.warning("skip ComfyUI T2I generation because there are no valid terms")
+        _persist_material_sources(task_id, material_sources)
+        return video_paths
+
+    clip_duration = calculate_comfyui_t2i_clip_duration(
+        required_duration,
+        len(valid_terms),
+    )
+    if clip_duration <= 0:
+        logger.warning("skip ComfyUI T2I generation because clip timing is invalid")
+        _persist_material_sources(task_id, material_sources)
+        return video_paths
+
+    logger.info(
+        "ComfyUI T2I automatic image timing: "
+        f"audio={required_duration:.2f}s, "
+        f"images={len(valid_terms)}, "
+        f"duration_per_image={clip_duration:.3f}s, "
+        f"fps={COMFYUI_T2I_RENDER_FPS}"
+    )
+
+    for search_term in valid_terms:
+        items = generate_images_comfyui_t2i(
+            search_term=search_term,
+            minimum_duration=math.ceil(clip_duration),
+            video_aspect=video_aspect,
+            save_dir=material_directory,
+        )
+        for item in items:
+            video_file = _render_openai_image_video(
+                item.url,
+                clip_duration,
+            )
+            if not video_file:
+                continue
+
+            logger.info(f"image material rendered: {video_file}")
+            video_paths.append(video_file)
+
+            try:
+                material_sources.append(_material_source_record(item, video_file))
+            except Exception as source_error:
+                logger.warning(
+                    "failed to prepare generated material source record: "
+                    f"provider=comfyui_t2i, "
+                    f"error={type(source_error).__name__}, detail={source_error}"
+                )
+
+            total_duration += clip_duration
+
+    logger.success(
+        f"generated and rendered {len(video_paths)} ComfyUI T2I materials"
+    )
+    _persist_material_sources(task_id, material_sources)
+    return video_paths
+
+
+# Legacy function names kept as small wrappers so local imports or tests written
+# against the first Mage-specific implementation continue to work.
+def generate_images_comfyui_mage(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    save_dir: str = "",
+) -> List[MaterialInfo]:
+    return generate_images_comfyui_t2i(
+        search_term=search_term,
+        minimum_duration=minimum_duration,
+        video_aspect=video_aspect,
+        save_dir=save_dir,
+    )
+
+
+def _download_videos_comfyui_mage_on_demand(
+    *,
+    task_id: str,
+    search_terms: List[str],
+    video_aspect: VideoAspect,
+    audio_duration: float,
+    max_clip_duration: int,
+    material_directory: str,
+) -> List[str]:
+    return _download_videos_comfyui_t2i_on_demand(
+        task_id=task_id,
+        search_terms=search_terms,
+        video_aspect=video_aspect,
+        audio_duration=audio_duration,
+        max_clip_duration=max_clip_duration,
+        material_directory=material_directory,
+    )
+
+
+COMFYUI_VIDEO_DEFAULT_BASE_URL = COMFYUI_T2I_DEFAULT_BASE_URL
+COMFYUI_VIDEO_REQUEST_TIMEOUT = (10, 60)
+COMFYUI_VIDEO_POLL_INTERVAL_SECONDS = 2.0
+COMFYUI_VIDEO_MAX_WAIT_SECONDS = 7200
+COMFYUI_VIDEO_TIMING_SAFETY_SECONDS = 0.10
+COMFYUI_VIDEO_SUPPORTED_EXTENSIONS = {".mp4", ".webm", ".mov", ".mkv"}
+
+
+def _comfyui_video_config_value(
+    key: str,
+    default: str = "",
+    *,
+    app_config: dict | None = None,
+) -> str:
+    app_config = config.app if app_config is None else app_config
+    value = app_config.get(key, default)
+    if value in (None, ""):
+        value = default
+    return str(value).strip()
+
+
+def _comfyui_video_bool_config(
+    key: str,
+    default: bool = False,
+    *,
+    app_config: dict | None = None,
+) -> bool:
+    app_config = config.app if app_config is None else app_config
+    value = app_config.get(key, default)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def is_comfyui_video_resolution_override_enabled(app_config: dict | None = None) -> bool:
+    return _comfyui_video_bool_config(
+        "comfyui_video_override_resolution",
+        False,
+        app_config=app_config,
+    )
+
+
+def is_comfyui_video_enabled(app_config: dict | None = None) -> bool:
+    base_url = _comfyui_video_config_value(
+        "comfyui_video_base_url",
+        COMFYUI_VIDEO_DEFAULT_BASE_URL,
+        app_config=app_config,
+    )
+    workflow_path = _comfyui_video_config_value(
+        "comfyui_video_workflow_path",
+        app_config=app_config,
+    )
+    return bool(base_url and workflow_path)
+
+
+
+class ComfyUIVideoError(RuntimeError):
+    """Raised for local ComfyUI T2V configuration/input errors."""
+
+
+_COMFYUI_VIDEO_ANCHOR_HEADER_RE = re.compile(
+    r"^\s*(\[[A-Z][A-Z0-9_-]{0,63}\])\s*$"
+)
+_COMFYUI_VIDEO_ANCHOR_REF_RE = re.compile(r"\[[A-Z][A-Z0-9_-]{0,63}\]")
+
+
+def parse_comfyui_video_subject_anchors(raw_anchors: str | None) -> dict[str, str]:
+    """
+    Parse reusable subject anchors.
+
+    Format:
+        [CHAR_1]
+        A lean man in his early thirties...
+
+        [LOC_1]
+        An abandoned wooden cabin...
+
+    Anchor names are intentionally generic: CHAR_, LOC_, OBJ_, VEH_, CREATURE_, etc.
+    are conventions only. Any uppercase token matching ``[A-Z0-9_-]`` is accepted.
+    Descriptions may span multiple lines until the next anchor heading.
+    """
+    text = str(raw_anchors or "").strip()
+    if not text:
+        return {}
+
+    anchors: dict[str, str] = {}
+    current_tag: str | None = None
+    description_lines: list[str] = []
+
+    def flush_current() -> None:
+        nonlocal current_tag, description_lines
+        if current_tag is None:
+            return
+        description = " ".join(
+            line.strip() for line in description_lines if line.strip()
+        ).strip()
+
+        # Subject Anchors are inserted inside larger scene sentences, so terminal
+        # punctuation would produce malformed text such as "city.,", "object..",
+        # or "character.'s". Store anchors as reusable noun phrases instead.
+        description = description.rstrip(" \t\r\n.,;:!?")
+
+        if not description:
+            raise ValueError(
+                f"Subject Anchor {current_tag} has no description."
+            )
+        if current_tag in anchors:
+            raise ValueError(
+                f"Subject Anchor {current_tag} is defined more than once."
+            )
+        anchors[current_tag] = description
+        current_tag = None
+        description_lines = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        match = _COMFYUI_VIDEO_ANCHOR_HEADER_RE.fullmatch(line)
+        if match:
+            flush_current()
+            current_tag = match.group(1)
+            description_lines = []
+            continue
+
+        if current_tag is None:
+            raise ValueError(
+                "Subject Anchors must start with a tag such as [CHAR_1], "
+                "[LOC_1], [OBJ_1], [VEH_1], or [CREATURE_1]."
+            )
+        description_lines.append(line)
+
+    flush_current()
+    return anchors
+
+
+def expand_comfyui_video_scene_prompts(
+    scene_prompts: str | list[str] | None,
+    subject_anchors: str | None = "",
+) -> list[str]:
+    """
+    Expand anchor references in one-scene-per-line ComfyUI T2V prompts.
+
+    Only explicitly referenced anchors are inserted in each scene. This lets a cast,
+    location, creature, vehicle, or prop appear in some clips without bloating every
+    prompt. Unknown ``[UPPERCASE_TAG]`` references are rejected before inference so
+    an expensive local generation is not started with unresolved placeholders.
+    """
+    if isinstance(scene_prompts, str):
+        prompts = [
+            line.strip()
+            for line in scene_prompts.splitlines()
+            if line.strip()
+        ]
+    elif isinstance(scene_prompts, list):
+        prompts = [
+            str(line).strip()
+            for line in scene_prompts
+            if str(line).strip()
+        ]
+    elif scene_prompts is None:
+        prompts = []
+    else:
+        raise ValueError("Scene Prompts must be text or a list of strings.")
+
+    anchors = parse_comfyui_video_subject_anchors(subject_anchors)
+    expanded_prompts: list[str] = []
+
+    for prompt in prompts:
+        referenced_tags = set(_COMFYUI_VIDEO_ANCHOR_REF_RE.findall(prompt))
+        unknown_tags = sorted(tag for tag in referenced_tags if tag not in anchors)
+        if unknown_tags:
+            raise ValueError(
+                "Scene Prompt references undefined Subject Anchor(s): "
+                + ", ".join(unknown_tags)
+            )
+
+        expanded = _COMFYUI_VIDEO_ANCHOR_REF_RE.sub(
+            lambda match: anchors.get(match.group(0), match.group(0)),
+            prompt,
+        ).strip()
+        if expanded:
+            expanded_prompts.append(expanded)
+
+    return expanded_prompts
+
+
+def _comfyui_video_base_url() -> str:
+    return _comfyui_video_config_value(
+        "comfyui_video_base_url",
+        COMFYUI_VIDEO_DEFAULT_BASE_URL,
+    ).rstrip("/")
+
+
+def _comfyui_video_workflow_path() -> str:
+    workflow_path = _comfyui_video_config_value("comfyui_video_workflow_path")
+    if not workflow_path:
+        raise ValueError(
+            "\n\n##### comfyui_video_workflow_path is not set #####\n\n"
+            f"Please set it in the config.toml file: {config.config_file}\n"
+        )
+    if not os.path.isfile(workflow_path):
+        raise FileNotFoundError(
+            f"ComfyUI Video workflow file not found: {workflow_path}"
+        )
+    return workflow_path
+
+
+def _comfyui_video_size(video_aspect: VideoAspect) -> tuple[int, int]:
+    # Keep local AI image/video aspect handling consistent.
+    return _comfyui_t2i_size(video_aspect)
+
+
+def _comfyui_video_prompt(search_term: str) -> str:
+    template = _comfyui_video_config_value("comfyui_video_prompt_template")
+    if not template or "{term}" not in template:
+        return search_term
+    return template.replace("{term}", search_term)
+
+
+def _comfyui_video_negative_prompt() -> str:
+    return _comfyui_video_config_value("comfyui_video_negative_prompt")
+
+
+def _load_comfyui_video_workflow() -> dict:
+    workflow_path = _comfyui_video_workflow_path()
+    with open(workflow_path, "r", encoding="utf-8") as file:
+        data = json.load(file)
+    if not isinstance(data, dict):
+        raise ValueError("ComfyUI Video workflow must be a JSON object")
+    return data
+
+
+def _comfyui_node_label(node: dict) -> str:
+    if not isinstance(node, dict):
+        return ""
+    class_type = str(node.get("class_type", "") or "")
+    meta = node.get("_meta")
+    title = str(meta.get("title", "") or "") if isinstance(meta, dict) else ""
+    return f"{class_type} {title}".lower()
+
+
+def _set_comfyui_text_input(inputs: dict, value: str) -> bool:
+    """Replace a literal prompt input without overwriting graph references."""
+    for key in ("text", "prompt"):
+        current = inputs.get(key)
+        if isinstance(current, str):
+            inputs[key] = value
+            return True
+    return False
+
+
+def _set_comfyui_prompt_literal(node: dict, value: str) -> bool:
+    """
+    Replace a literal prompt-like value on a node.
+
+    Standard CLIP encoders expose ``text``/``prompt``. Some modern ComfyUI video
+    workflows instead expose a ``PrimitiveStringMultiline`` (or equivalent)
+    node whose only editable field is ``value``. We only treat ``value`` as text
+    when the node label/title itself clearly describes a prompt/text/string input,
+    so generic primitive values elsewhere in the graph remain untouched.
+    """
+    if not isinstance(node, dict):
+        return False
+    inputs = node.get("inputs")
+    if not isinstance(inputs, dict):
+        return False
+
+    if _set_comfyui_text_input(inputs, value):
+        return True
+
+    label = _comfyui_node_label(node)
+    if (
+        isinstance(inputs.get("value"), str)
+        and any(token in label for token in ("prompt", "text", "string"))
+    ):
+        inputs["value"] = value
+        return True
+    return False
+
+
+def _iter_comfyui_upstream_node_ids(node: dict):
+    """Yield node ids referenced by an API-workflow node, preserving input order."""
+    if not isinstance(node, dict):
+        return
+    inputs = node.get("inputs")
+    if not isinstance(inputs, dict):
+        return
+    for input_value in inputs.values():
+        referenced_id = _workflow_input_reference_node_id(input_value)
+        if referenced_id:
+            yield referenced_id
+
+
+def _set_comfyui_prompt_upstream(
+    workflow: dict,
+    start_node_id: str | None,
+    value: str,
+    *,
+    reject_negative_labels: bool = False,
+    max_depth: int = 8,
+) -> bool:
+    """
+    Follow graph references until a literal prompt source is found.
+
+    This is needed by workflows such as LTX-2.5 where conditioning points to a
+    CLIP encoder, the encoder points to a switch, and the switch finally points
+    to a ``PrimitiveStringMultiline`` prompt node.
+    """
+    if not start_node_id:
+        return False
+
+    queue: list[tuple[str, int]] = [(str(start_node_id), 0)]
+    visited: set[str] = set()
+    while queue:
+        node_id, depth = queue.pop(0)
+        if node_id in visited or depth > max_depth:
+            continue
+        visited.add(node_id)
+
+        node = workflow.get(node_id)
+        if not isinstance(node, dict):
+            continue
+        label = _comfyui_node_label(node)
+        if not (reject_negative_labels and "negative" in label):
+            if _set_comfyui_prompt_literal(node, value):
+                return True
+
+        for upstream_id in _iter_comfyui_upstream_node_ids(node):
+            if upstream_id not in visited:
+                queue.append((upstream_id, depth + 1))
+    return False
+
+
+def _find_distinct_comfyui_conditioning_pair(workflow: dict) -> tuple[str, str] | None:
+    """
+    Find a conditioning node whose positive and negative branches point to
+    different upstream nodes.
+
+    Guider nodes often expose positive/negative outputs from the *same* combined
+    conditioning node; those are not useful for locating literal prompt sources.
+    The distinct pair one level upstream usually is.
+    """
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        positive_id = _workflow_input_reference_node_id(inputs.get("positive"))
+        negative_id = _workflow_input_reference_node_id(inputs.get("negative"))
+        if positive_id and negative_id and positive_id != negative_id:
+            return positive_id, negative_id
+    return None
+
+
+def _prepare_comfyui_video_workflow(
+    search_term: str,
+    width: int,
+    height: int,
+    target_duration: float,
+) -> dict:
+    """
+    Adapt a ComfyUI T2V API workflow using structural detection.
+
+    The workflow remains authoritative for model-specific frame counts. A requested
+    MoneyPrinterTurbo clip duration is injected only when the graph exposes an
+    explicit seconds-based input; frame-count fields such as num_frames/length are
+    deliberately left untouched because many video models require special frame
+    strides (for example 4n+1 or 8n+1).
+    """
+    workflow = copy.deepcopy(_load_comfyui_video_workflow())
+    positive_prompt = _comfyui_video_prompt(search_term)
+    negative_prompt = _comfyui_video_negative_prompt()
+
+    prompt_updated = False
+    negative_updated = False
+    size_updated = False
+    seed_updated = False
+    duration_updated = False
+    prefix_updated = False
+
+    # Combined/custom nodes may expose positive and negative text directly.
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+
+        if isinstance(inputs.get("prompt"), str) and "negative_prompt" in inputs:
+            inputs["prompt"] = positive_prompt
+            prompt_updated = True
+        if isinstance(inputs.get("negative_prompt"), str):
+            inputs["negative_prompt"] = negative_prompt
+            negative_updated = True
+
+    # Prefer a structural positive/negative conditioning pair when available.
+    # This covers graphs such as LTX-2.5 where a conditioning node points to
+    # separate positive and negative branches, while the guider itself consumes
+    # both outputs from one combined-conditioning node.
+    conditioning_pair = _find_distinct_comfyui_conditioning_pair(workflow)
+    if conditioning_pair:
+        positive_start_id, negative_start_id = conditioning_pair
+        if not prompt_updated:
+            prompt_updated = _set_comfyui_prompt_upstream(
+                workflow,
+                positive_start_id,
+                positive_prompt,
+                reject_negative_labels=True,
+            )
+        if not negative_updated and negative_prompt:
+            negative_updated = _set_comfyui_prompt_upstream(
+                workflow,
+                negative_start_id,
+                negative_prompt,
+            )
+
+    sampler_id, sampler_node = _find_comfyui_sampler_node(workflow)
+    sampler_inputs = (
+        sampler_node.get("inputs", {}) if isinstance(sampler_node, dict) else {}
+    )
+
+    # Conventional samplers reference their positive/negative text encoders.
+    if isinstance(sampler_inputs, dict):
+        if not prompt_updated:
+            positive_node_id = _workflow_input_reference_node_id(
+                sampler_inputs.get("positive")
+            )
+            positive_node = workflow.get(positive_node_id or "")
+            if isinstance(positive_node, dict):
+                prompt_updated = _set_comfyui_prompt_upstream(
+                    workflow,
+                    positive_node_id,
+                    positive_prompt,
+                    reject_negative_labels=True,
+                )
+
+        if not negative_updated:
+            negative_node_id = _workflow_input_reference_node_id(
+                sampler_inputs.get("negative")
+            )
+            negative_node = workflow.get(negative_node_id or "")
+            if isinstance(negative_node, dict):
+                negative_updated = _set_comfyui_prompt_upstream(
+                    workflow,
+                    negative_node_id,
+                    negative_prompt,
+                )
+
+    # Video workflows frequently wrap conditioning in custom nodes instead of
+    # exposing KSampler positive/negative references. Prefer labels/titles that
+    # explicitly describe positive or negative prompt roles.
+    if not negative_updated:
+        for node in workflow.values():
+            if not isinstance(node, dict):
+                continue
+            label = _comfyui_node_label(node)
+            if "negative" not in label:
+                continue
+            inputs = node.get("inputs")
+            if isinstance(inputs, dict) and _set_comfyui_prompt_literal(
+                node, negative_prompt
+            ):
+                negative_updated = True
+                break
+
+    if not prompt_updated:
+        preferred_nodes = []
+        fallback_nodes = []
+        for node in workflow.values():
+            if not isinstance(node, dict):
+                continue
+            label = _comfyui_node_label(node)
+            if "negative" in label:
+                continue
+            inputs = node.get("inputs")
+            if not isinstance(inputs, dict):
+                continue
+            has_literal_text = any(
+                isinstance(inputs.get(key), str) for key in ("text", "prompt")
+            ) or (
+                isinstance(inputs.get("value"), str)
+                and any(token in label for token in ("prompt", "text", "string"))
+            )
+            if not has_literal_text:
+                continue
+            if any(
+                token in label
+                for token in (
+                    "positive",
+                    "prompt",
+                    "textencode",
+                    "text encode",
+                    "conditioning",
+                    "cliptext",
+                )
+            ):
+                preferred_nodes.append(inputs)
+            else:
+                fallback_nodes.append(inputs)
+
+        candidate_inputs = (
+            preferred_nodes[0]
+            if preferred_nodes
+            else (fallback_nodes[0] if fallback_nodes else None)
+        )
+        if candidate_inputs is not None:
+            # Recover the owning node so PrimitiveStringMultiline ``value`` is
+            # handled as well as conventional text/prompt fields.
+            for node in workflow.values():
+                if isinstance(node, dict) and node.get("inputs") is candidate_inputs:
+                    prompt_updated = _set_comfyui_prompt_literal(
+                        node, positive_prompt
+                    )
+                    break
+
+    # Video models often require model-specific dimensions (for example 1280x736
+    # instead of generic 1280x720). Preserve the exported workflow by default and
+    # only inject MoneyPrinterTurbo's aspect-based size when the user opts in.
+    override_resolution = is_comfyui_video_resolution_override_enabled()
+    if override_resolution:
+        preferred_size_nodes = []
+        for node in workflow.values():
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs")
+            if not isinstance(inputs, dict):
+                continue
+            if "width" not in inputs or "height" not in inputs:
+                continue
+            label = _comfyui_node_label(node)
+            if any(
+                token in label
+                for token in (
+                    "video",
+                    "latent",
+                    "empty",
+                    "resolution",
+                    "size",
+                    "t2v",
+                    "h3",
+                    "ltx",
+                    "wan",
+                    "minimax",
+                )
+            ):
+                preferred_size_nodes.append(inputs)
+        size_inputs = preferred_size_nodes[0] if preferred_size_nodes else None
+        if size_inputs is not None:
+            size_inputs["width"] = int(width)
+            size_inputs["height"] = int(height)
+            size_updated = True
+
+    # Randomize literal sampling seeds. Multi-stage video workflows may contain
+    # more than one RandomNoise node (for example base generation + refinement),
+    # so updating only the first node can leave the main stage fixed.
+    seed_count = 0
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        if "seed" in inputs and not isinstance(inputs.get("seed"), (list, tuple)):
+            inputs["seed"] = random.randint(1, 2**63 - 1)
+            seed_updated = True
+            seed_count += 1
+        if "noise_seed" in inputs and not isinstance(
+            inputs.get("noise_seed"), (list, tuple)
+        ):
+            inputs["noise_seed"] = random.randint(1, 2**63 - 1)
+            seed_updated = True
+            seed_count += 1
+
+    # Duration injection is intentionally conservative. We only touch fields that
+    # explicitly represent seconds. Generic frame-count fields remain workflow-defined.
+    try:
+        requested_seconds = max(float(target_duration), 1.0)
+    except (TypeError, ValueError):
+        requested_seconds = 0.0
+
+    if requested_seconds > 0:
+        strong_seconds_fields = (
+            "duration_seconds",
+            "video_duration_seconds",
+            "clip_duration_seconds",
+        )
+        video_seconds_fields = ("video_duration", "clip_duration", "seconds")
+
+        for node_id, node in workflow.items():
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs")
+            if not isinstance(inputs, dict):
+                continue
+
+            matched_key = next(
+                (
+                    key
+                    for key in strong_seconds_fields
+                    if key in inputs
+                    and isinstance(inputs.get(key), (int, float))
+                    and not isinstance(inputs.get(key), bool)
+                ),
+                None,
+            )
+            if matched_key is None:
+                label = _comfyui_node_label(node)
+                if any(
+                    token in label
+                    for token in (
+                        "video",
+                        "t2v",
+                        "duration",
+                        "h3",
+                        "ltx",
+                        "wan",
+                        "minimax",
+                    )
+                ):
+                    matched_key = next(
+                        (
+                            key
+                            for key in video_seconds_fields
+                            if key in inputs
+                            and isinstance(inputs.get(key), (int, float))
+                            and not isinstance(inputs.get(key), bool)
+                        ),
+                        None,
+                    )
+                    if matched_key is None and (
+                        "duration" in inputs
+                        and isinstance(inputs.get("duration"), (int, float))
+                        and not isinstance(inputs.get("duration"), bool)
+                    ):
+                        matched_key = "duration"
+
+            if matched_key is not None:
+                old_value = inputs.get(matched_key)
+                new_value = (
+                    int(round(requested_seconds))
+                    if isinstance(old_value, int)
+                    else float(requested_seconds)
+                )
+                inputs[matched_key] = new_value
+                logger.info(
+                    "ComfyUI Video duration injection: "
+                    f"node={node_id}, label={_comfyui_node_label(node)!r}, "
+                    f"field={matched_key}, old={old_value}, new={new_value}, "
+                    f"requested={requested_seconds:.2f}s"
+                )
+                duration_updated = True
+                break
+
+        # Primitive-style duration controls are common in recent ComfyUI video
+        # graphs. LTX-2.5, for example, uses a PrimitiveInt titled "Duration"
+        # whose value feeds a math node computing frames = duration * fps + 1.
+        if not duration_updated:
+            for node_id, node in workflow.items():
+                if not isinstance(node, dict):
+                    continue
+                inputs = node.get("inputs")
+                if not isinstance(inputs, dict):
+                    continue
+                label = _comfyui_node_label(node)
+                current_value = inputs.get("value")
+                if (
+                    "duration" in label
+                    and isinstance(current_value, (int, float))
+                    and not isinstance(current_value, bool)
+                ):
+                    new_value = (
+                        int(round(requested_seconds))
+                        if isinstance(current_value, int)
+                        else float(requested_seconds)
+                    )
+                    inputs["value"] = new_value
+                    logger.info(
+                        "ComfyUI Video duration injection: "
+                        f"node={node_id}, label={label!r}, field=value, "
+                        f"old={current_value}, new={new_value}, "
+                        f"requested={requested_seconds:.2f}s"
+                    )
+                    duration_updated = True
+                    break
+
+    # SaveVideo/VHS_VideoCombine and similar nodes commonly expose filename_prefix.
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if isinstance(inputs, dict) and "filename_prefix" in inputs:
+            inputs["filename_prefix"] = f"mpt_comfyui_video_{uuid.uuid4().hex[:8]}"
+            prefix_updated = True
+            break
+
+    if not prompt_updated:
+        raise ValueError(
+            "Could not identify a prompt input in the ComfyUI Video workflow. "
+            "Use an API workflow with a text/prompt input or sampler-linked "
+            "positive conditioning."
+        )
+
+    if negative_prompt and not negative_updated:
+        logger.warning(
+            "ComfyUI Video negative prompt was configured but no compatible "
+            "negative conditioning input was detected; continuing without injecting it."
+        )
+    if override_resolution and not size_updated:
+        logger.warning(
+            "ComfyUI Video resolution override is enabled but no compatible "
+            "width/height input was detected; the workflow's own resolution will be used."
+        )
+    elif not override_resolution:
+        logger.debug(
+            "ComfyUI Video keeps the workflow-defined resolution; final composition "
+            "will resize/crop it to the selected MoneyPrinterTurbo aspect ratio."
+        )
+    if not seed_updated:
+        logger.debug(
+            "ComfyUI Video workflow has no detectable seed/noise_seed input; "
+            "the workflow's existing seed behavior will be used."
+        )
+    elif seed_count > 1:
+        logger.debug(
+            f"ComfyUI Video randomized {seed_count} literal sampling seeds "
+            "across a multi-stage workflow."
+        )
+    if requested_seconds > 0 and not duration_updated:
+        logger.info(
+            "ComfyUI Video workflow has no explicit seconds-based duration input; "
+            f"requested clip duration {requested_seconds:.2f}s will be used only "
+            "for final trimming, while the workflow keeps its own frame count/duration."
+        )
+    if not prefix_updated:
+        logger.debug(
+            "ComfyUI Video workflow has no filename_prefix input; output discovery "
+            "will rely on ComfyUI history."
+        )
+
+    return workflow
+
+
+def _extract_first_comfyui_video(output_payload: dict) -> dict | None:
+    """Find a video file descriptor in ComfyUI history output."""
+    if not isinstance(output_payload, dict):
+        return None
+
+    preferred_keys = ("videos", "video", "gifs", "files", "images")
+
+    def iter_candidates(value):
+        if isinstance(value, dict):
+            if value.get("filename"):
+                yield value
+            for key in preferred_keys:
+                if key in value:
+                    yield from iter_candidates(value[key])
+            # Some custom nodes use nested result/output dictionaries.
+            for key, nested in value.items():
+                if key not in preferred_keys and isinstance(nested, (dict, list)):
+                    yield from iter_candidates(nested)
+        elif isinstance(value, list):
+            for item in value:
+                yield from iter_candidates(item)
+
+    for candidate in iter_candidates(output_payload):
+        filename = str(candidate.get("filename") or "").strip()
+        if not filename:
+            continue
+        suffix = Path(filename).suffix.lower()
+        format_name = str(
+            candidate.get("format")
+            or candidate.get("mime_type")
+            or candidate.get("type_name")
+            or ""
+        ).lower()
+        if suffix in COMFYUI_VIDEO_SUPPORTED_EXTENSIONS or format_name.startswith(
+            "video/"
+        ):
+            return candidate
+
+    return None
+
+
+def _request_comfyui_video_output(
+    search_term: str,
+    width: int,
+    height: int,
+    target_duration: float,
+) -> tuple[bytes, dict]:
+    base_url = _comfyui_video_base_url()
+    workflow = _prepare_comfyui_video_workflow(
+        search_term=search_term,
+        width=width,
+        height=height,
+        target_duration=target_duration,
+    )
+
+    submit_response = requests.post(
+        f"{base_url}/prompt",
+        json={"prompt": workflow},
+        proxies=config.proxy,
+        verify=_get_tls_verify(),
+        timeout=COMFYUI_VIDEO_REQUEST_TIMEOUT,
+    )
+    if submit_response.status_code >= 400:
+        raise ValueError(
+            f"ComfyUI Video prompt submission failed: HTTP "
+            f"{submit_response.status_code} {str(submit_response.text)[:300]}"
+        )
+
+    submit_body = submit_response.json()
+    prompt_id = str(submit_body.get("prompt_id") or "").strip()
+    if not prompt_id:
+        raise ValueError(f"ComfyUI did not return prompt_id: {submit_body}")
+
+    deadline = time.time() + COMFYUI_VIDEO_MAX_WAIT_SECONDS
+    last_payload = None
+
+    while time.time() < deadline:
+        history_response = requests.get(
+            f"{base_url}/history/{prompt_id}",
+            proxies=config.proxy,
+            verify=_get_tls_verify(),
+            timeout=(10, 30),
+        )
+        if history_response.status_code >= 400:
+            raise ValueError(
+                f"ComfyUI Video history request failed: HTTP "
+                f"{history_response.status_code} "
+                f"{str(history_response.text)[:300]}"
+            )
+
+        history_body = history_response.json()
+        last_payload = history_body
+
+        history_item = None
+        if isinstance(history_body, dict):
+            if prompt_id in history_body and isinstance(history_body[prompt_id], dict):
+                history_item = history_body[prompt_id]
+            elif "outputs" in history_body:
+                history_item = history_body
+
+        if isinstance(history_item, dict):
+            video_info = _extract_first_comfyui_video(
+                history_item.get("outputs", {})
+            )
+            if video_info:
+                view_response = requests.get(
+                    f"{base_url}/view",
+                    params={
+                        "filename": video_info.get("filename", ""),
+                        "subfolder": video_info.get("subfolder", ""),
+                        "type": video_info.get("type", "output"),
+                    },
+                    proxies=config.proxy,
+                    verify=_get_tls_verify(),
+                    timeout=(10, 600),
+                )
+                if view_response.status_code >= 400:
+                    raise ValueError(
+                        f"ComfyUI Video download failed: HTTP "
+                        f"{view_response.status_code} "
+                        f"{str(view_response.text)[:300]}"
+                    )
+                if not view_response.content:
+                    raise ValueError("ComfyUI Video returned an empty output file")
+                return view_response.content, video_info
+
+            status = history_item.get("status")
+            if isinstance(status, dict) and status.get("completed") is True:
+                raise ValueError(
+                    "ComfyUI workflow completed but no supported video output "
+                    f"was found. Supported extensions: "
+                    f"{', '.join(sorted(COMFYUI_VIDEO_SUPPORTED_EXTENSIONS))}"
+                )
+
+        time.sleep(COMFYUI_VIDEO_POLL_INTERVAL_SECONDS)
+
+    raise TimeoutError(
+        "Timed out waiting for ComfyUI Video output after "
+        f"{COMFYUI_VIDEO_MAX_WAIT_SECONDS}s. Last payload: {last_payload}"
+    )
+
+
+def _comfyui_video_local_suffix(video_info: dict) -> str:
+    filename = str(video_info.get("filename") or "").strip()
+    suffix = Path(filename).suffix.lower()
+    if suffix in COMFYUI_VIDEO_SUPPORTED_EXTENSIONS:
+        return suffix
+
+    format_name = str(
+        video_info.get("format")
+        or video_info.get("mime_type")
+        or ""
+    ).lower()
+    if "webm" in format_name:
+        return ".webm"
+    if "quicktime" in format_name or "mov" in format_name:
+        return ".mov"
+    if "matroska" in format_name or "mkv" in format_name:
+        return ".mkv"
+    return ".mp4"
+
+
+def _save_and_probe_comfyui_video(
+    video_bytes: bytes,
+    video_info: dict,
+    save_dir: str,
+) -> tuple[str, float, int, int, float]:
+    if not save_dir:
+        raise ValueError("ComfyUI Video save directory is empty")
+    os.makedirs(save_dir, exist_ok=True)
+
+    suffix = _comfyui_video_local_suffix(video_info)
+    output_path = os.path.join(
+        save_dir,
+        f"comfyui-video-{uuid.uuid4().hex[:12]}{suffix}",
+    )
+    with open(output_path, "wb") as file:
+        file.write(video_bytes)
+
+    clip = None
+    try:
+        clip = VideoFileClip(output_path)
+        duration = float(clip.duration or 0)
+        fps = float(clip.fps or 0)
+        width = int(getattr(clip, "w", 0) or 0)
+        height = int(getattr(clip, "h", 0) or 0)
+        if duration <= 0 or fps <= 0 or width <= 0 or height <= 0:
+            raise ValueError(
+                "ComfyUI Video output could not be validated as a playable clip"
+            )
+    except Exception:
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+        raise
+    finally:
+        if clip is not None:
+            try:
+                clip.close()
+            except Exception as close_error:
+                logger.warning(
+                    "failed to close ComfyUI Video probe clip: "
+                    f"path={output_path}, error={close_error}"
+                )
+
+    return output_path, duration, width, height, fps
+
+
+def generate_videos_comfyui_video(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    save_dir: str = "",
+) -> List[MaterialInfo]:
+    aspect = VideoAspect(video_aspect)
+    width, height = _comfyui_video_size(aspect)
+    try:
+        target_duration = max(float(minimum_duration), 1.0)
+    except (TypeError, ValueError):
+        target_duration = 3.0
+
+    logger.info(
+        "generating video via ComfyUI: "
+        f"term={search_term!r}, target_size={width}x{height}, "
+        f"requested_clip_duration={target_duration:.2f}s"
+    )
+
+    try:
+        video_bytes, video_info = _request_comfyui_video_output(
+            search_term=search_term,
+            width=width,
+            height=height,
+            target_duration=target_duration,
+        )
+        (
+            video_path,
+            actual_duration,
+            actual_width,
+            actual_height,
+            actual_fps,
+        ) = _save_and_probe_comfyui_video(
+            video_bytes=video_bytes,
+            video_info=video_info,
+            save_dir=save_dir,
+        )
+    except Exception as exc:
+        logger.error(
+            "ComfyUI Video generation failed: "
+            f"term={search_term!r}, error={type(exc).__name__}, detail={exc}"
+        )
+        return []
+
+    item = MaterialInfo()
+    item.provider = "comfyui_video"
+    item.url = video_path
+    item.duration = max(1, int(math.ceil(actual_duration)))
+    item.source_info = {
+        "provider": "comfyui_video",
+        "search_term": search_term,
+        "actual_duration": actual_duration,
+        "fps": actual_fps,
+        "rendition": {
+            "id": None,
+            "width": actual_width,
+            "height": actual_height,
+        },
+    }
+    return [item]
+
+
+def _download_videos_comfyui_video_on_demand(
+    *,
+    task_id: str,
+    search_terms: List[str],
+    video_aspect: VideoAspect,
+    audio_duration: float,
+    max_clip_duration: int,
+    material_directory: str,
+) -> List[str]:
+    """
+    Generate one local ComfyUI T2V clip per term, in term order.
+
+    We intentionally do not cycle terms indefinitely when the narration is longer
+    than the available Scene Prompts. Local video inference can take many minutes per
+    clip, so the theoretical prompt-count coverage is validated before inference.
+    If the supplied prompts cannot cover narration + safety margin at the selected
+    Clip Duration, the task fails early instead of inevitably looping clips later.
+    """
+    if not material_directory:
+        material_directory = utils.task_dir(task_id)
+
+    try:
+        required_duration = float(audio_duration)
+    except (TypeError, ValueError):
+        required_duration = 0.0
+    if not math.isfinite(required_duration) or required_duration <= 0:
+        logger.warning(
+            "skip ComfyUI Video generation because required audio duration is "
+            f"not positive/finite: duration={audio_duration}"
+        )
+        _persist_material_sources(task_id, [])
+        return []
+
+    try:
+        clip_limit = max(float(max_clip_duration), 1.0)
+    except (TypeError, ValueError):
+        clip_limit = 3.0
+
+    valid_terms = [
+        term.strip()
+        for term in search_terms
+        if isinstance(term, str) and term.strip()
+    ]
+    if not valid_terms:
+        logger.warning(
+            "skip ComfyUI Video generation because there are no valid terms"
+        )
+        _persist_material_sources(task_id, [])
+        return []
+
+    video_paths: List[str] = []
+    material_sources: list[dict[str, Any]] = []
+    total_usable_duration = 0.0
+    required_with_margin = (
+        required_duration + COMFYUI_VIDEO_TIMING_SAFETY_SECONDS
+    )
+
+    # Fail before starting expensive local inference when the available scene
+    # prompts cannot possibly cover the narration. The final combiner can only use
+    # ``clip_limit`` seconds from each generated clip, even if the workflow outputs
+    # a longer file.
+    clips_required = max(1, int(math.ceil(required_with_margin / clip_limit)))
+    if len(valid_terms) < clips_required:
+        raise ComfyUIVideoError(
+            "ComfyUI Video needs at least "
+            f"{clips_required} Scene Prompts to cover {required_with_margin:.2f}s "
+            f"at {clip_limit:.2f}s per clip; only {len(valid_terms)} were provided. "
+            "Add more Scene Prompts or increase Clip Duration."
+        )
+
+    for search_term in valid_terms:
+        items = generate_videos_comfyui_video(
+            search_term=search_term,
+            minimum_duration=int(math.ceil(clip_limit)),
+            video_aspect=video_aspect,
+            save_dir=material_directory,
+        )
+        for item in items:
+            if not item.url or not os.path.isfile(item.url):
+                continue
+
+            source_info = (
+                item.source_info if isinstance(item.source_info, dict) else {}
+            )
+            try:
+                actual_duration = float(
+                    source_info.get("actual_duration", item.duration)
+                )
+            except (TypeError, ValueError):
+                actual_duration = float(item.duration or 0)
+
+            if actual_duration <= 0:
+                continue
+
+            video_paths.append(item.url)
+            try:
+                material_sources.append(
+                    _material_source_record(item, item.url)
+                )
+            except Exception as source_error:
+                logger.warning(
+                    "failed to prepare generated material source record: "
+                    f"provider=comfyui_video, "
+                    f"error={type(source_error).__name__}, detail={source_error}"
+                )
+
+            usable_duration = min(clip_limit, actual_duration)
+            total_usable_duration += usable_duration
+            logger.info(
+                "ComfyUI Video material ready: "
+                f"path={item.url}, actual={actual_duration:.2f}s, "
+                f"usable={usable_duration:.2f}s, "
+                f"coverage={total_usable_duration:.2f}/{required_with_margin:.2f}s"
+            )
+
+            if total_usable_duration >= required_with_margin:
+                break
+
+        if total_usable_duration >= required_with_margin:
+            logger.info(
+                "ComfyUI Video materials cover the required narration duration; "
+                f"generated={total_usable_duration:.2f}s, "
+                f"required={required_with_margin:.2f}s"
+            )
+            break
+
+    if total_usable_duration < required_with_margin:
+        logger.warning(
+            "ComfyUI Video materials do not fully cover narration: "
+            f"usable={total_usable_duration:.2f}s, "
+            f"required={required_with_margin:.2f}s. "
+            "Add more video terms or use a longer-duration workflow to avoid "
+            "the final combiner reusing clips."
+        )
+
+    logger.success(
+        f"generated and downloaded {len(video_paths)} ComfyUI Video materials"
+    )
+    _persist_material_sources(task_id, material_sources)
+    return video_paths
+
+
+def _download_comfyui_video_with_timeline(
+    *,
+    task_id: str,
+    search_terms: List[str],
+    video_aspect: VideoAspect,
+    audio_duration: float,
+    max_clip_duration: int,
+    clip_speed: float,
+    shot_timeline: list[dict[str, Any]],
+    material_directory: str,
+) -> List[str]:
+    """Generate exactly one ComfyUI T2V clip for each locked media shot.
+
+    Legacy local T2V is coverage-driven and may stop as soon as aggregate duration
+    is sufficient. A narrative timeline cannot do that: every prompt is tied to one
+    authoritative shot window, so all shots must be generated in order and any
+    failed/short source aborts the task rather than shifting later prompts.
+    """
+    if not material_directory:
+        material_directory = utils.task_dir(task_id)
+
+    entries = timeline_media.pair_prompts_with_timeline(
+        search_terms,
+        shot_timeline,
+        audio_duration=audio_duration,
+        max_clip_duration=max_clip_duration,
+    )
+    normalized_speed = utils.normalize_clip_speed(clip_speed)
+    video_paths: List[str] = []
+    material_sources: list[dict[str, Any]] = []
+
+    logger.info(
+        "timeline-aware T2V generation: "
+        f"provider=comfyui_video, shots={len(entries)}, "
+        f"audio={audio_duration:.3f}s, max_clip={float(max_clip_duration):.3f}s, "
+        f"clip_speed={normalized_speed:.2f}x"
+    )
+
+    for entry in entries:
+        shot_index = int(entry["index"])
+        target_duration = float(entry["duration"])
+        required_source_duration = timeline_media.source_duration_for_timeline_shot(
+            target_duration, normalized_speed
+        )
+        request_seconds = timeline_media.generation_seconds_for_timeline_video_shot(
+            target_duration, normalized_speed
+        )
+        prompt = str(entry["prompt"])
+
+        logger.info(
+            "generating timeline T2V shot: "
+            f"shot={shot_index}/{len(entries)}, "
+            f"start={float(entry['start']):.3f}s, end={float(entry['end']):.3f}s, "
+            f"target={target_duration:.3f}s, source_required={required_source_duration:.3f}s, "
+            f"request={request_seconds}s"
+        )
+
+        items = generate_videos_comfyui_video(
+            search_term=prompt,
+            minimum_duration=request_seconds,
+            video_aspect=video_aspect,
+            save_dir=material_directory,
+        )
+        item = next(
+            (
+                candidate
+                for candidate in items
+                if candidate.url and os.path.isfile(candidate.url)
+            ),
+            None,
+        )
+        if item is None:
+            raise timeline_media.TimelineMediaError(
+                f"timeline T2V failed to generate a playable clip for shot {shot_index}"
+            )
+
+        source_info = item.source_info if isinstance(item.source_info, dict) else {}
+        try:
+            actual_duration = float(source_info.get("actual_duration", item.duration))
+        except (TypeError, ValueError, OverflowError):
+            actual_duration = float(item.duration or 0)
+
+        if not timeline_media.timeline_video_source_is_long_enough(
+            actual_duration, target_duration, normalized_speed
+        ):
+            raise timeline_media.TimelineMediaError(
+                "timeline T2V source is too short for its locked shot: "
+                f"shot={shot_index}, actual={actual_duration:.3f}s, "
+                f"required={required_source_duration:.3f}s"
+            )
+
+        video_paths.append(item.url)
+        try:
+            record = _material_source_record(item, item.url)
+            record["timeline_shot"] = {
+                "index": shot_index,
+                "start": float(entry["start"]),
+                "end": float(entry["end"]),
+                "target_duration": target_duration,
+                "required_source_duration": required_source_duration,
+                "requested_generation_seconds": request_seconds,
+                "actual_source_duration": actual_duration,
+            }
+            material_sources.append(record)
+        except Exception as source_error:
+            logger.warning(
+                "failed to prepare timeline T2V source record: "
+                f"shot={shot_index}, error={type(source_error).__name__}, "
+                f"detail={source_error}"
+            )
+
+    if len(video_paths) != len(entries):
+        raise timeline_media.TimelineMediaError(
+            "timeline T2V did not produce exactly one material per locked shot"
+        )
+
+    _persist_material_sources(task_id, material_sources)
+    logger.success(
+        f"generated and downloaded {len(video_paths)} timeline-aware T2V materials"
+    )
     return video_paths
 
 
@@ -1655,6 +3545,283 @@ def _search_videos_with_cache(
         return items
 
 
+def _download_t2i_images_with_timeline(
+    *,
+    task_id: str,
+    search_terms: List[str],
+    source: str,
+    video_aspect: VideoAspect,
+    audio_duration: float,
+    max_clip_duration: int,
+    clip_speed: float,
+    shot_timeline: list[dict[str, Any]],
+    material_directory: str,
+) -> List[str]:
+    """Generate exactly one AI image for each locked media shot.
+
+    Unlike legacy coverage-based T2I, this path never stops early after enough total
+    seconds have been generated: every locked shot must receive its own image. Any
+    failed shot aborts the timeline path so later prompts cannot silently slide into
+    the wrong narration window.
+    """
+    if not material_directory:
+        material_directory = utils.task_dir(task_id)
+
+    entries = timeline_media.pair_prompts_with_timeline(
+        search_terms,
+        shot_timeline,
+        audio_duration=audio_duration,
+        max_clip_duration=max_clip_duration,
+    )
+    normalized_speed = utils.normalize_clip_speed(clip_speed)
+
+    if source == "openai_image":
+        generate_image = generate_images_openai
+        provider_name = "openai_image"
+    elif source in {"comfyui_t2i", "comfyui_mage"}:
+        generate_image = generate_images_comfyui_t2i
+        provider_name = "comfyui_t2i"
+    else:
+        raise timeline_media.TimelineMediaError(
+            f"timeline-aware T2I does not support source: {source}"
+        )
+
+    video_paths: List[str] = []
+    material_sources: list[dict[str, Any]] = []
+
+    logger.info(
+        "timeline-aware T2I generation: "
+        f"provider={provider_name}, shots={len(entries)}, "
+        f"audio={audio_duration:.3f}s, max_clip={float(max_clip_duration):.3f}s, "
+        f"clip_speed={normalized_speed:.2f}x"
+    )
+
+    for entry in entries:
+        shot_index = int(entry["index"])
+        target_duration = float(entry["duration"])
+        source_duration = timeline_media.source_duration_for_timeline_shot(
+            target_duration,
+            normalized_speed,
+        )
+        prompt = str(entry["prompt"])
+        logger.info(
+            "generating timeline T2I shot: "
+            f"shot={shot_index}/{len(entries)}, start={entry['start']:.3f}s, "
+            f"end={entry['end']:.3f}s, target={target_duration:.3f}s"
+        )
+
+        items = generate_image(
+            search_term=prompt,
+            minimum_duration=max(1, math.ceil(source_duration)),
+            video_aspect=video_aspect,
+            save_dir=material_directory,
+        )
+        if not items:
+            raise timeline_media.TimelineMediaError(
+                f"timeline T2I failed to generate image for shot {shot_index}"
+            )
+
+        # Each T2I provider currently returns one image per prompt. Be strict here:
+        # accepting multiple/zero outputs would destroy the one-shot/one-image map.
+        item = items[0]
+        video_file = _render_openai_image_video(item.url, source_duration)
+        if not video_file:
+            raise timeline_media.TimelineMediaError(
+                f"timeline T2I failed to render image for shot {shot_index}"
+            )
+
+        video_paths.append(video_file)
+        try:
+            record = _material_source_record(item, video_file)
+            record.update(
+                {
+                    "shot_index": shot_index,
+                    "shot_start": round(float(entry["start"]), 6),
+                    "shot_end": round(float(entry["end"]), 6),
+                    "shot_duration": round(target_duration, 6),
+                }
+            )
+            material_sources.append(record)
+        except Exception as source_error:
+            logger.warning(
+                "failed to prepare timeline T2I source record: "
+                f"provider={provider_name}, shot={shot_index}, "
+                f"error={type(source_error).__name__}, detail={source_error}"
+            )
+
+    if len(video_paths) != len(entries):
+        raise timeline_media.TimelineMediaError(
+            "timeline T2I did not produce exactly one material per locked shot"
+        )
+
+    logger.success(
+        f"generated and rendered {len(video_paths)} timeline-aware T2I materials"
+    )
+    _persist_material_sources(task_id, material_sources)
+    return video_paths
+
+
+
+def _download_hybrid_media_plan_with_timeline(
+    *,
+    task_id: str,
+    search_terms: List[str],
+    video_aspect: VideoAspect,
+    audio_duration: float,
+    max_clip_duration: int,
+    clip_speed: float,
+    shot_timeline: list[dict[str, Any]],
+    media_plan: list[dict[str, Any]],
+    material_directory: str,
+) -> List[str]:
+    """Generate one ordered material per locked shot using each row's provider."""
+    if not material_directory:
+        material_directory = utils.task_dir(task_id)
+
+    entries = timeline_media.normalize_hybrid_media_plan(
+        media_plan,
+        shot_timeline,
+        search_terms,
+        audio_duration=audio_duration,
+        max_clip_duration=max_clip_duration,
+    )
+    normalized_speed = utils.normalize_clip_speed(clip_speed)
+    video_paths: List[str] = []
+    material_sources: list[dict[str, Any]] = []
+    provider_counts: dict[str, int] = {}
+    for entry in entries:
+        provider = str(entry["provider"])
+        provider_counts[provider] = provider_counts.get(provider, 0) + 1
+
+    logger.info(
+        "hybrid timeline media generation: "
+        f"shots={len(entries)}, providers={provider_counts}, "
+        f"audio={float(audio_duration):.3f}s, "
+        f"max_clip={float(max_clip_duration):.3f}s, clip_speed={normalized_speed:.2f}x"
+    )
+
+    for entry in entries:
+        shot_index = int(entry["index"])
+        provider = str(entry["provider"])
+        prompt = str(entry["prompt"])
+        target_duration = float(entry["duration"])
+        required_source_duration = timeline_media.source_duration_for_timeline_shot(
+            target_duration, normalized_speed
+        )
+        logger.info(
+            "generating hybrid media shot: "
+            f"shot={shot_index}/{len(entries)}, provider={provider}, "
+            f"type={entry['resource_type']}, start={float(entry['start']):.3f}s, "
+            f"end={float(entry['end']):.3f}s, target={target_duration:.3f}s"
+        )
+
+        if provider in timeline_media.HYBRID_MEDIA_IMAGE_PROVIDERS:
+            generate_image = (
+                generate_images_openai
+                if provider == "openai_image"
+                else generate_images_comfyui_t2i
+            )
+            items = generate_image(
+                search_term=prompt,
+                minimum_duration=max(1, math.ceil(required_source_duration)),
+                video_aspect=video_aspect,
+                save_dir=material_directory,
+            )
+            if not items:
+                raise timeline_media.TimelineMediaError(
+                    f"hybrid media generation failed for image shot {shot_index} ({provider})"
+                )
+            item = items[0]
+            video_file = _render_openai_image_video(
+                item.url,
+                required_source_duration,
+                motion=str(entry.get("motion", "static") or "static"),
+            )
+            if not video_file:
+                raise timeline_media.TimelineMediaError(
+                    f"hybrid media rendering failed for image shot {shot_index} ({provider})"
+                )
+            material_path = video_file
+            actual_source_duration = required_source_duration
+            request_seconds = None
+        elif provider == "comfyui_video":
+            request_seconds = timeline_media.generation_seconds_for_timeline_video_shot(
+                target_duration, normalized_speed
+            )
+            items = generate_videos_comfyui_video(
+                search_term=prompt,
+                minimum_duration=request_seconds,
+                video_aspect=video_aspect,
+                save_dir=material_directory,
+            )
+            item = next(
+                (
+                    candidate
+                    for candidate in items
+                    if candidate.url and os.path.isfile(candidate.url)
+                ),
+                None,
+            )
+            if item is None:
+                raise timeline_media.TimelineMediaError(
+                    f"hybrid media generation failed for video shot {shot_index} (comfyui_video)"
+                )
+            source_info = item.source_info if isinstance(item.source_info, dict) else {}
+            try:
+                actual_source_duration = float(
+                    source_info.get("actual_duration", item.duration)
+                )
+            except (TypeError, ValueError, OverflowError):
+                actual_source_duration = float(item.duration or 0)
+            if not timeline_media.timeline_video_source_is_long_enough(
+                actual_source_duration, target_duration, normalized_speed
+            ):
+                raise timeline_media.TimelineMediaError(
+                    "hybrid ComfyUI Video source is too short for its locked shot: "
+                    f"shot={shot_index}, actual={actual_source_duration:.3f}s, "
+                    f"required={required_source_duration:.3f}s"
+                )
+            material_path = item.url
+        else:
+            raise timeline_media.TimelineMediaError(
+                f"hybrid media shot {shot_index} has unsupported provider: {provider}"
+            )
+
+        video_paths.append(material_path)
+        try:
+            record = _material_source_record(item, material_path)
+            record["timeline_shot"] = {
+                "index": shot_index,
+                "start": float(entry["start"]),
+                "end": float(entry["end"]),
+                "target_duration": target_duration,
+                "required_source_duration": required_source_duration,
+                "actual_source_duration": actual_source_duration,
+                "provider": provider,
+                "resource_type": entry["resource_type"],
+                "motion": entry.get("motion", ""),
+            }
+            if request_seconds is not None:
+                record["timeline_shot"]["requested_generation_seconds"] = request_seconds
+            material_sources.append(record)
+        except Exception as source_error:
+            logger.warning(
+                "failed to prepare hybrid media source record: "
+                f"provider={provider}, shot={shot_index}, "
+                f"error={type(source_error).__name__}, detail={source_error}"
+            )
+
+    if len(video_paths) != len(entries):
+        raise timeline_media.TimelineMediaError(
+            "hybrid media plan did not produce exactly one material per locked shot"
+        )
+    _persist_material_sources(task_id, material_sources)
+    logger.success(
+        f"generated {len(video_paths)} hybrid timeline-aware media materials"
+    )
+    return video_paths
+
+
 def download_videos(
     task_id: str,
     search_terms: List[str],
@@ -1664,6 +3831,9 @@ def download_videos(
     audio_duration: float = 0.0,
     max_clip_duration: int = 5,
     match_script_order: bool = False,
+    clip_speed: float = 1.0,
+    shot_timeline: list[dict[str, Any]] | None = None,
+    media_plan: list[dict[str, Any]] | None = None,
 ) -> List[str]:
     provider = "pexels"
     remote_search_videos = search_videos_pexels
@@ -1692,6 +3862,19 @@ def download_videos(
         material_directory = utils.task_dir(task_id)
     elif material_directory and not os.path.isdir(material_directory):
         material_directory = ""
+
+    if shot_timeline and media_plan:
+        return _download_hybrid_media_plan_with_timeline(
+            task_id=task_id,
+            search_terms=search_terms,
+            video_aspect=video_aspect,
+            audio_duration=audio_duration,
+            max_clip_duration=max_clip_duration,
+            clip_speed=clip_speed,
+            shot_timeline=shot_timeline,
+            media_plan=media_plan,
+            material_directory=material_directory,
+        )
 
     if source == "wavespeed":
         # AI 生成按条计费，不能沿用库存源"先为全部关键词取回候选、再挑选"
@@ -1741,11 +3924,60 @@ def download_videos(
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
         )
+    if shot_timeline and timeline_media.is_timeline_aware_image_source(source):
+        return _download_t2i_images_with_timeline(
+            task_id=task_id,
+            search_terms=search_terms,
+            source=source,
+            video_aspect=video_aspect,
+            audio_duration=audio_duration,
+            max_clip_duration=max_clip_duration,
+            clip_speed=clip_speed,
+            shot_timeline=shot_timeline,
+            material_directory=material_directory,
+        )
+
+    if shot_timeline and timeline_media.is_timeline_aware_video_source(source):
+        if source != "comfyui_video":
+            raise timeline_media.TimelineMediaError(
+                f"timeline-aware T2V does not support source: {source}"
+            )
+        return _download_comfyui_video_with_timeline(
+            task_id=task_id,
+            search_terms=search_terms,
+            video_aspect=video_aspect,
+            audio_duration=audio_duration,
+            max_clip_duration=max_clip_duration,
+            clip_speed=clip_speed,
+            shot_timeline=shot_timeline,
+            material_directory=material_directory,
+        )
+
     if source == "openai_image":
         # 与 WaveSpeed 相同的按需付费语义：文生图按张计费，逐段生成、凑够
         # 所需时长立即停止。生成结果是一次性的本地图片文件，也不参与 24
         # 小时搜索缓存——缓存会让不同任务反复拿到同一张图。
         return _download_videos_openai_image_on_demand(
+            task_id=task_id,
+            search_terms=search_terms,
+            video_aspect=video_aspect,
+            audio_duration=audio_duration,
+            max_clip_duration=max_clip_duration,
+            material_directory=material_directory,
+        )
+
+    if source in {"comfyui_t2i", "comfyui_mage"}:
+        return _download_videos_comfyui_t2i_on_demand(
+            task_id=task_id,
+            search_terms=search_terms,
+            video_aspect=video_aspect,
+            audio_duration=audio_duration,
+            max_clip_duration=max_clip_duration,
+            material_directory=material_directory,
+        )
+
+    if source == "comfyui_video":
+        return _download_videos_comfyui_video_on_demand(
             task_id=task_id,
             search_terms=search_terms,
             video_aspect=video_aspect,

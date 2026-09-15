@@ -39,6 +39,7 @@ from app.models.schema import (
     VideoTransitionMode,
 )
 from app.services import bgm as bgm_service
+from app.services import timeline_media
 from app.services.utils import video_effects
 from app.utils import file_security, utils
 
@@ -737,6 +738,186 @@ def _fit_clip_to_canvas(
     return CompositeVideoClip(
         [background, resized_clip], size=(target_width, target_height)
     ).with_duration(clip.duration)
+
+
+
+def _retime_clip_to_duration(clip, target_duration: float):
+    """Adjust tiny/intentional speed differences without changing the shot window."""
+    target = float(target_duration)
+    current = float(getattr(clip, "duration", 0.0) or 0.0)
+    if target <= 0 or current <= 0:
+        raise ValueError("clip duration must be positive for timeline retiming")
+    if math.isclose(current, target, abs_tol=1e-4):
+        return clip
+    # MoviePy speed scaling uses output_duration = input_duration / factor.
+    return clip.with_speed_scaled(current / target)
+
+
+def _fit_clip_to_timeline_window(clip, target_duration: float):
+    """Trim long sources and only retime tiny shortfalls to a locked shot window.
+
+    AI video generators commonly return a whole-second clip that is slightly longer
+    than the semantic shot. Trimming preserves motion speed. Stretching a clearly
+    short generated clip would instead slow the action and hide an upstream duration
+    failure, so only sub-frame / codec-scale shortfalls are corrected by retiming.
+    """
+    target = float(target_duration)
+    current = float(getattr(clip, "duration", 0.0) or 0.0)
+    if target <= 0 or current <= 0:
+        raise timeline_media.TimelineMediaError(
+            "clip duration must be positive for timeline fitting"
+        )
+
+    if current >= target:
+        if current > target + 1e-4:
+            return clip.subclipped(0, target)
+        return clip.with_duration(target)
+
+    shortfall = target - current
+    if shortfall > timeline_media.TIMELINE_OUTPUT_SHORTFALL_TOLERANCE_SECONDS:
+        raise timeline_media.TimelineMediaError(
+            "timeline material is too short for its locked shot: "
+            f"source={current:.3f}s, target={target:.3f}s"
+        )
+    return _retime_clip_to_duration(clip, target)
+
+
+def combine_videos_with_timeline(
+    combined_video_path: str,
+    video_paths: List[str],
+    audio_file: str,
+    shot_timeline,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    video_transition_mode: VideoTransitionMode = None,
+    max_clip_duration: float = 5,
+    threads: int = 2,
+    clip_speed: float = 1.0,
+    video_fit_mode: VideoFitMode = VideoFitMode.cover,
+) -> str:
+    """Combine one prepared material per locked audio-first shot.
+
+    This is deliberately separate from ``combine_videos``. The legacy compositor
+    may split, stop after aggregate coverage, or loop materials for a safety margin;
+    all three behaviors are correct for stock/random workflows but would shift a
+    locked narrative timeline. Here every source path maps 1:1 to one validated shot
+    and no extra clip is inserted.
+    """
+    audio_clip = AudioFileClip(audio_file)
+    try:
+        real_audio_duration = float(audio_clip.duration)
+    finally:
+        close_clip(audio_clip)
+
+    shots = timeline_media.normalize_locked_shot_timeline(
+        shot_timeline,
+        audio_duration=real_audio_duration,
+        max_clip_duration=max_clip_duration,
+        expected_count=len(video_paths),
+    )
+    if len(video_paths) != len(shots):
+        raise timeline_media.TimelineMediaError(
+            "timeline compositor requires exactly one material per locked shot"
+        )
+
+    normalized_clip_speed = utils.normalize_clip_speed(clip_speed)
+    aspect = VideoAspect(video_aspect)
+    fit_mode = VideoFitMode(video_fit_mode)
+    video_width, video_height = aspect.to_resolution()
+    transition_value = getattr(video_transition_mode, "value", video_transition_mode)
+    output_dir = os.path.dirname(combined_video_path)
+    processed_files: list[str] = []
+
+    logger.info(
+        "starting timeline-aware clip compositor: "
+        f"shots={len(shots)}, audio={real_audio_duration:.3f}s, "
+        f"clip_speed={normalized_clip_speed:.2f}x"
+    )
+
+    try:
+        for position, (video_path, shot) in enumerate(zip(video_paths, shots), start=1):
+            target_duration = float(shot["duration"])
+            clip = _open_video_clip_quietly(video_path)
+            try:
+                if normalized_clip_speed != 1.0:
+                    clip = clip.with_speed_scaled(normalized_clip_speed)
+
+                # Generated T2V may be longer than the locked semantic window. Trim
+                # rather than speeding it up; only tiny codec/frame shortfalls are
+                # retimed so narrative timing remains exact without distorting motion.
+                clip = _fit_clip_to_timeline_window(clip, target_duration)
+
+                clip_w, clip_h = clip.size
+                if clip_w != video_width or clip_h != video_height:
+                    clip = _fit_clip_to_canvas(
+                        clip,
+                        target_width=video_width,
+                        target_height=video_height,
+                        fit_mode=fit_mode,
+                    )
+
+                shuffle_side = random.choice(["left", "right", "top", "bottom"])
+                if transition_value in (None, VideoTransitionMode.none.value):
+                    pass
+                elif transition_value == VideoTransitionMode.fade_in.value:
+                    clip = video_effects.fadein_transition(clip, 1)
+                elif transition_value == VideoTransitionMode.fade_out.value:
+                    clip = video_effects.fadeout_transition(clip, 1)
+                elif transition_value == VideoTransitionMode.slide_in.value:
+                    clip = video_effects.slidein_transition(clip, 1, shuffle_side)
+                elif transition_value == VideoTransitionMode.slide_out.value:
+                    clip = video_effects.slideout_transition(clip, 1, shuffle_side)
+                elif transition_value == VideoTransitionMode.zoom_in.value:
+                    clip = video_effects.zoomin_transition(clip, 1)
+                elif transition_value == VideoTransitionMode.zoom_out.value:
+                    clip = video_effects.zoomout_transition(clip, 1)
+                elif transition_value == VideoTransitionMode.shuffle.value:
+                    transition_funcs = [
+                        lambda c: video_effects.fadein_transition(c, 1),
+                        lambda c: video_effects.fadeout_transition(c, 1),
+                        lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
+                        lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
+                        lambda c: video_effects.zoomin_transition(c, 1),
+                        lambda c: video_effects.zoomout_transition(c, 1),
+                    ]
+                    clip = random.choice(transition_funcs)(clip)
+
+                # Transition effects must stay inside the assigned window and may not
+                # accumulate temporal drift into later narrative shots.
+                clip = _fit_clip_to_timeline_window(clip, target_duration)
+
+                temp_file = os.path.join(output_dir, f"timeline-temp-clip-{position}.mp4")
+                _write_videofile_with_codec_fallback(
+                    clip,
+                    temp_file,
+                    codec=_get_configured_video_codec(),
+                    logger=None,
+                    fps=fps,
+                )
+                processed_files.append(temp_file)
+                logger.debug(
+                    "timeline shot prepared: "
+                    f"shot={position}, start={shot['start']:.3f}s, "
+                    f"end={shot['end']:.3f}s, duration={target_duration:.3f}s"
+                )
+            finally:
+                close_clip(clip)
+
+        if len(processed_files) != len(shots):
+            raise timeline_media.TimelineMediaError(
+                "timeline compositor did not prepare every locked shot"
+            )
+
+        concat_video_clips_with_ffmpeg(
+            clip_files=processed_files,
+            output_file=combined_video_path,
+            threads=threads,
+            output_dir=output_dir,
+            max_duration=real_audio_duration,
+        )
+        logger.info("timeline-aware video combining completed")
+        return combined_video_path
+    finally:
+        delete_files(processed_files)
 
 
 def combine_videos(
@@ -1523,33 +1704,61 @@ def generate_video(
         return bgm_mix_succeeded
 
 
-def render_image_zoom_video(image_path: str, clip_duration: int = 5) -> str:
-    """
-    将单张本地图片渲染为带缓慢放大效果的 mp4 片段，返回输出文件路径。
+STILL_IMAGE_MOTION_STATIC = "static"
+STILL_IMAGE_MOTION_ZOOM_IN = "zoom_in"
+_STILL_IMAGE_MOTION_VALUES = {
+    STILL_IMAGE_MOTION_STATIC,
+    STILL_IMAGE_MOTION_ZOOM_IN,
+}
 
-    local 素材预处理和 OpenAI 兼容文生图素材共用这段"图片 → 片段"渲染
-    逻辑：ImageClip 按 clip_duration 固定时长播放，并叠加每秒约 3% 的
-    动态放大，避免静态画面在成片中显得呆板。渲染异常由调用方按各自
-    素材源的失败约定处理。
+
+def normalize_still_image_motion(value: str | None) -> str:
+    """Normalize the global still-image motion preference."""
+    normalized = str(value or "").strip().lower()
+    if normalized in _STILL_IMAGE_MOTION_VALUES:
+        return normalized
+    # Preserve MoneyPrinterTurbo's historical behavior for old configs.
+    return STILL_IMAGE_MOTION_ZOOM_IN
+
+
+def configured_still_image_motion() -> str:
+    """Return the persisted WebUI preference used by all still-image sources."""
+    return normalize_still_image_motion(
+        config.ui.get("still_image_motion", STILL_IMAGE_MOTION_ZOOM_IN)
+    )
+
+
+def render_image_zoom_video(
+    image_path: str,
+    clip_duration: int | float = 5,
+    motion: str | None = None,
+) -> str:
+    """Render one still image as an MP4 using the selected global motion mode.
+
+    The historical function name is kept for compatibility with existing callers/tests.
+    ``motion=None`` reads the persisted WebUI preference. ``static`` keeps every frame
+    identical; ``zoom_in`` preserves the original ~3% per-second slow zoom.
     """
+    selected_motion = normalize_still_image_motion(
+        configured_still_image_motion() if motion is None else motion
+    )
     clip = ImageClip(image_path).with_duration(clip_duration).with_position("center")
     try:
-        # Apply a zoom effect using the resize method.
-        # A lambda function is used to make the zoom effect dynamic over time.
-        # The zoom effect starts from the original size and gradually scales up to 120%.
-        # t represents the current time, and clip.duration is the total duration of the clip.
-        # Note: 1 represents 100% size, so 1.2 represents 120%.
-        zoom_clip = clip.resized(
-            lambda t: 1 + (clip_duration * 0.03) * (t / clip.duration)
-        )
+        if selected_motion == STILL_IMAGE_MOTION_ZOOM_IN:
+            rendered_clip = clip.resized(
+                lambda t: 1 + (float(clip_duration) * 0.03) * (t / clip.duration)
+            )
+        else:
+            rendered_clip = clip
 
-        # Optionally, create a composite video clip containing the zoomed clip.
-        # This is useful if you want to add other elements to the video.
-        final_clip = CompositeVideoClip([zoom_clip])
+        final_clip = CompositeVideoClip([rendered_clip])
         try:
-            # Output the video to a file.
             video_file = f"{image_path}.mp4"
-            final_clip.write_videofile(video_file, fps=30, logger=None)
+            final_clip.write_videofile(video_file, fps=fps, logger=None)
+            logger.debug(
+                f"rendered still image material: motion={selected_motion}, "
+                f"duration={float(clip_duration):.3f}s, file={os.path.basename(video_file)}"
+            )
             return video_file
         finally:
             close_clip(final_clip)

@@ -278,7 +278,15 @@ def str_contains_punctuation(word):
     return False
 
 
-def split_string_by_punctuations(s):
+def split_string_by_punctuations(s, keep_punctuation: bool = False):
+    """
+    Split text at configured punctuation marks.
+
+    By default punctuation is removed to preserve the historical behaviour used
+    by search-term generation and timing estimates.  Subtitle paths can opt in
+    to ``keep_punctuation=True`` so sentence-ending marks such as ``?`` and ``!``
+    survive in the rendered SRT text.
+    """
     result = []
     txt = ""
 
@@ -295,6 +303,8 @@ def split_string_by_punctuations(s):
             previous_char = s[i - 1]
         if i < len(s) - 1:
             next_char = s[i + 1]
+        else:
+            next_char = ""
 
         if char == "." and previous_char.isdigit() and next_char.isdigit():
             # # In the case of "withdraw 10,000, charged at 2.5% fee", the dot in "2.5" should not be treated as a line break marker
@@ -311,9 +321,18 @@ def split_string_by_punctuations(s):
 
         if char not in const.PUNCTUATIONS:
             txt += char
-        else:
-            result.append(txt.strip())
-            txt = ""
+            continue
+
+        if keep_punctuation:
+            txt += char
+            # Keep runs such as "..." or "?!" attached to the same sentence
+            # instead of producing punctuation-only subtitle items.
+            if next_char in const.PUNCTUATIONS:
+                continue
+
+        result.append(txt.strip())
+        txt = ""
+
     result.append(txt.strip())
     # filter empty string
     result = list(filter(None, result))

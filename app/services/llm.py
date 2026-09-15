@@ -614,9 +614,17 @@ def _generate_response(prompt: str, app_config=None) -> str:
             base_url=base_url,
         )
 
-        response = client.chat.completions.create(
-            model=model_name, messages=[{"role": "user", "content": prompt}]
-        )
+        request_kwargs = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+
+        if llm_provider == "ollama":
+            request_kwargs["extra_body"] = {
+                "reasoning_effort": "none"
+            }
+
+        response = client.chat.completions.create(**request_kwargs)
         if response:
             if isinstance(response, ChatCompletion):
                 return _extract_chat_completion_text(response, llm_provider)
@@ -823,70 +831,395 @@ def _strip_code_fence(text: str) -> str:
     return t.strip()
 
 
+AI_VISUAL_PROMPT_SOURCES = frozenset(
+    {
+        "wavespeed",
+        "volcengine_seedance",
+        "ofox",
+        "metaso_minimax",
+        "loomloom",
+        "openai_image",
+        "comfyui_t2i",
+        "comfyui_mage",
+        "comfyui_video",
+    }
+)
+
+
+def should_generate_visual_prompts(video_source: str | None) -> bool:
+    """Return whether a material source consumes generative visual prompts."""
+    return str(video_source or "").strip() in AI_VISUAL_PROMPT_SOURCES
+
+
+def calculate_visual_prompt_count(
+    duration_min: float,
+    duration_max: float,
+    clip_duration: float,
+) -> int:
+    """Return the recommended prompt count from the midpoint narration duration."""
+    try:
+        minimum = float(duration_min)
+        maximum = float(duration_max)
+        per_clip = float(clip_duration)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("duration values must be numeric") from exc
+
+    if not all(math.isfinite(value) for value in (minimum, maximum, per_clip)):
+        raise ValueError("duration values must be finite")
+    if minimum < 0 or maximum < 0:
+        raise ValueError("duration values cannot be negative")
+    if maximum < minimum:
+        minimum, maximum = maximum, minimum
+    if per_clip <= 0:
+        raise ValueError("clip_duration must be greater than zero")
+
+    midpoint = (minimum + maximum) / 2.0
+    return max(1, math.ceil(midpoint / per_clip))
+
+
+_VISUAL_ANCHOR_TAG_RE = re.compile(r"^(CHAR|LOC|OBJ|VEH|CREATURE)_[1-9]\d*$")
+_VISUAL_ANCHOR_REFERENCE_RE = re.compile(r"\[([A-Z][A-Z0-9_]*)\]")
+_VISUAL_ANCHOR_CATEGORY_ORDER = {
+    "CHAR": 0,
+    "LOC": 1,
+    "OBJ": 2,
+    "VEH": 3,
+    "CREATURE": 4,
+}
+
+
+def _normalize_visual_prompt_lines(visual_prompts) -> List[str]:
+    """Normalize the current visual-prompt field without splitting internal commas."""
+    if isinstance(visual_prompts, str):
+        prompts = [line.strip() for line in visual_prompts.splitlines() if line.strip()]
+        if not prompts and visual_prompts.strip():
+            prompts = [visual_prompts.strip()]
+    elif isinstance(visual_prompts, (list, tuple)):
+        prompts = [str(prompt).strip() for prompt in visual_prompts if str(prompt).strip()]
+    else:
+        raise ValueError("visual_prompts must be a string or a list of strings")
+
+    if not prompts:
+        raise ValueError("at least one visual prompt is required")
+    return prompts
+
+
+def _load_json_object_response(response: str) -> dict:
+    """Parse a JSON object, tolerating a provider-added code fence or short wrapper text."""
+    cleaned = _strip_code_fence(response)
+    try:
+        data = json.loads(cleaned)
+    except Exception:
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if not match:
+            raise ValueError("response does not contain a JSON object")
+        data = json.loads(match.group())
+    if not isinstance(data, dict):
+        raise ValueError("response is not a JSON object")
+    return data
+
+
+def _normalize_visual_anchor_plan(data: dict, expected_scene_count: int) -> dict:
+    """Validate and normalize the LLM continuity plan before it reaches Streamlit."""
+    raw_anchors = data.get("subject_anchors")
+    raw_scenes = data.get("scene_prompts")
+    if not isinstance(raw_anchors, list):
+        raise ValueError("subject_anchors must be a JSON array")
+    if not isinstance(raw_scenes, list):
+        raise ValueError("scene_prompts must be a JSON array")
+    if len(raw_scenes) != expected_scene_count:
+        raise ValueError(
+            "scene prompt count changed during anchor generation: "
+            f"expected={expected_scene_count}, received={len(raw_scenes)}"
+        )
+
+    anchors = []
+    defined_tags = set()
+    for raw_anchor in raw_anchors:
+        if not isinstance(raw_anchor, dict):
+            raise ValueError("each subject anchor must be a JSON object")
+        tag = str(raw_anchor.get("tag") or "").strip()
+        if tag.startswith("[") and tag.endswith("]"):
+            tag = tag[1:-1].strip()
+        description = str(raw_anchor.get("description") or "").strip()
+        if not _VISUAL_ANCHOR_TAG_RE.fullmatch(tag):
+            raise ValueError(f"invalid Subject Anchor tag: [{tag or '?'}]")
+        if tag in defined_tags:
+            raise ValueError(f"Subject Anchor [{tag}] is defined more than once")
+        if not description:
+            raise ValueError(f"Subject Anchor [{tag}] has an empty description")
+        if _VISUAL_ANCHOR_REFERENCE_RE.search(description):
+            raise ValueError(
+                f"Subject Anchor [{tag}] description must not contain anchor references"
+            )
+        defined_tags.add(tag)
+        anchors.append({"tag": tag, "description": description})
+
+    scene_prompts = []
+    referenced_tags = set()
+    expected_indices = list(range(1, expected_scene_count + 1))
+    received_indices = []
+    for position, raw_scene in enumerate(raw_scenes, start=1):
+        if isinstance(raw_scene, dict):
+            index = raw_scene.get("index")
+            prompt = str(raw_scene.get("prompt") or "").strip()
+            try:
+                index = int(index)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("each scene prompt index must be an integer") from exc
+        elif isinstance(raw_scene, str):
+            # Preserve compatibility with models that obey array order but omit index objects.
+            index = position
+            prompt = raw_scene.strip()
+        else:
+            raise ValueError("each scene prompt must be a JSON object or string")
+
+        if not prompt:
+            raise ValueError(f"scene prompt {position} is empty")
+        received_indices.append(index)
+        references = set(_VISUAL_ANCHOR_REFERENCE_RE.findall(prompt))
+        undefined = sorted(references - defined_tags)
+        if undefined:
+            raise ValueError(
+                "scene prompt references undefined Subject Anchor(s): "
+                + ", ".join(f"[{tag}]" for tag in undefined)
+            )
+        referenced_tags.update(references)
+        scene_prompts.append(prompt)
+
+    if received_indices != expected_indices:
+        raise ValueError(
+            "scene prompt indices must preserve the original order exactly: "
+            f"expected={expected_indices}, received={received_indices}"
+        )
+
+    unused = sorted(defined_tags - referenced_tags)
+    if unused:
+        raise ValueError(
+            "Subject Anchors must be used by at least one Scene Prompt: "
+            + ", ".join(f"[{tag}]" for tag in unused)
+        )
+    if anchors and not referenced_tags:
+        raise ValueError("Scene Prompts did not use the generated Subject Anchors")
+
+    def anchor_sort_key(anchor):
+        prefix, number = anchor["tag"].rsplit("_", 1)
+        return (_VISUAL_ANCHOR_CATEGORY_ORDER[prefix], int(number))
+
+    anchors.sort(key=anchor_sort_key)
+    anchor_text = "\n\n".join(
+        f"[{anchor['tag']}]\n{anchor['description']}" for anchor in anchors
+    )
+    return {
+        "subject_anchors": anchor_text,
+        "scene_prompts": scene_prompts,
+        "anchor_count": len(anchors),
+        "scene_count": len(scene_prompts),
+    }
+
+
+def generate_subject_anchors_and_scene_prompts(
+    visual_prompts,
+    video_subject: str = "",
+    video_script: str = "",
+    app_config=None,
+) -> dict:
+    """
+    Convert visual prompts into reusable continuity anchors plus anchored scene prompts.
+
+    The output always preserves the exact number and order of the source prompts. Stable
+    identity belongs in Subject Anchors; transient action, framing, lighting, and mood stay
+    in the individual Scene Prompts.
+    """
+    prompts = _normalize_visual_prompt_lines(visual_prompts)
+    indexed_prompts = [
+        {"index": index, "prompt": prompt}
+        for index, prompt in enumerate(prompts, start=1)
+    ]
+    clean_script = utils.remove_pause_tags(video_script or "").strip()
+    prompt = f"""
+# Role: Visual Continuity Editor
+
+## Goal
+Turn the supplied Visual Prompts into a reusable Subject Anchor library and rewrite every
+scene to reference those anchors. This is prompt preprocessing for image/video generation;
+do not invent a new story or change scene order.
+
+## Output Format
+Return ONLY one valid JSON object with exactly these two keys:
+1. "subject_anchors": an array of objects with exactly "tag" and "description".
+2. "scene_prompts": an array of objects with exactly "index" and "prompt".
+
+## Constraints
+1. Preserve exactly {len(prompts)} Scene Prompts, with indices 1 through {len(prompts)} in that exact order.
+2. Never merge, split, omit, duplicate, or reorder scenes.
+3. Allowed anchor tags are only CHAR_n, LOC_n, OBJ_n, VEH_n, and CREATURE_n, where n starts at 1.
+4. Use CHAR for people or characters; LOC for locations, backgrounds, rooms, buildings, exteriors, or environments; OBJ for objects, props, doors, windows, machines, devices, or visually distinctive structures; VEH for vehicles; CREATURE for non-human creatures.
+5. Create anchors for recurring visual elements whose stable appearance helps continuity. Also create an anchor for a visually distinctive or narratively important object, structure, doorway, prop, vehicle, creature, or location even if it appears in only one scene when preserving its identity would improve continuity, spatial understanding, framing, or later reuse. Prioritize the main character, important locations/backgrounds, distinctive recurring objects, and story-critical visual elements. Do not create anchors for generic disposable details that have no meaningful visual identity.
+6. Treat visually distinct interiors and exteriors as separate LOC anchors when they represent meaningfully different environments. For example, the exterior of an isolated building and its interior broadcast room should normally use different LOC anchors when both are visually important. Anchor descriptions must contain stable visible identity only: age range, build, hair, clothing, materials, colors, architecture, shape, wear, layout, or other persistent traits. Write every anchor description as a compact noun phrase rather than a complete sentence; begin with a lowercase article such as "a" or "an" when natural, and do not end the description with punctuation. Do not bake temporary poses, expressions, camera angles, scene-specific lighting, damage states, or actions into an anchor unless they are permanently defining features. Do not include carried items, held props, temporary accessories, or scene-specific possessions in a character anchor unless they are a permanent defining part of that character's design. If source prompts disagree about a detail, keep only traits that are consistent across appearances; never invent a new trait just to resolve the conflict.
+7. Rewritten Scene Prompts must use [TAG] references instead of repeating the anchored element's full identity description, while preserving that scene's action, composition, lighting, atmosphere, and transient state. Treat each [TAG] as a complete noun phrase. Do not attach possessive endings directly to a tag such as [CHAR_1]'s or [OBJ_1]'s. Rewrite the sentence so the tag acts as a grammatical subject or object. For example, prefer "[CHAR_1] turns the knob by hand" over "[CHAR_1]'s hand turns the knob", and prefer "Close-up of [OBJ_1], focusing on its glowing dial" over "Close-up of [OBJ_1]'s glowing dial".
+8. Every [TAG] used in a Scene Prompt must be defined in subject_anchors, and every generated Subject Anchor must be used by at least one Scene Prompt.
+9. Keep Scene Prompts in English. Do not add a global art style; the downstream ComfyUI prompt template handles style.
+10. Do not add markdown, commentary, code fences, captions, subtitles, logos, or explanatory text.
+11. Treat the original Visual Prompts as authoritative. The script and subject are context only and must not cause you to add, remove, or reorder scenes.
+
+## Video Subject
+{video_subject}
+
+## Video Script Context
+{clean_script}
+
+## Visual Prompts (authoritative order)
+{json.dumps(indexed_prompts, ensure_ascii=False)}
+""".strip()
+
+    logger.info(
+        "generating Subject Anchors and Scene Prompts: "
+        f"scene_count={len(prompts)}"
+    )
+    response = ""
+    for i in range(_max_retries):
+        try:
+            if app_config is None:
+                response = _generate_response(prompt)
+            else:
+                response = _generate_response(prompt, app_config=app_config)
+            if response.startswith("Error: "):
+                logger.error(f"failed to generate visual continuity plan: {response}")
+                return {}
+            plan = _normalize_visual_anchor_plan(
+                _load_json_object_response(response),
+                expected_scene_count=len(prompts),
+            )
+            logger.success(
+                "completed visual continuity plan: "
+                f"anchors={plan['anchor_count']}, scenes={plan['scene_count']}"
+            )
+            return plan
+        except Exception as exc:
+            logger.warning(
+                "failed to generate visual continuity plan: "
+                f"{str(exc)}"
+            )
+        if i < _max_retries - 1:
+            logger.warning(
+                "failed to generate visual continuity plan, trying again... "
+                f"{i + 1}"
+            )
+
+    return {}
+
+
 def generate_terms(
     video_subject: str,
     video_script: str,
     amount: int = 5,
     match_script_order: bool = False,
+    visual_prompt_mode: bool = False,
     app_config=None,
 ) -> List[str]:
     video_script = utils.remove_pause_tags(video_script or "").strip()
-    if match_script_order:
-        goal = (
-            f"Generate {amount} chronological stock-video search terms that follow "
-            "the order of topics in the video script."
-        )
-        ordering_rule = (
-            "6. keep the terms in the same order as the script narration; "
-            "earlier terms must describe earlier visual moments."
-        )
-        # 有序关键词模式下，示例数量要和 amount 保持一致，避免模型被固定
-        # 的 4 个示例误导，导致长文案只返回少量关键词，影响素材覆盖度。
-        example_terms = [
-            "opening visual topic",
-            *[f"script visual topic {index}" for index in range(2, max(amount, 1))],
-            "final visual topic",
-        ]
-        output_example = json.dumps(example_terms[:amount], ensure_ascii=False)
-    else:
-        goal = (
-            f"Generate {amount} search terms for stock videos, depending on the "
-            "subject of a video."
-        )
-        ordering_rule = ""
-        output_example = (
-            '["search term 1", "search term 2", "search term 3",'
-            '"search term 4", "search term 5"]'
-        )
+    amount = max(int(amount or 1), 1)
 
-    prompt = f"""
-# Role: Video Search Terms Generator
+    if visual_prompt_mode:
+        if match_script_order:
+            goal = (
+                f"Generate exactly {amount} chronological visual scene prompts that "
+                "follow the narration from beginning to end."
+            )
+            ordering_rule = (
+                "8. keep the prompts in the same order as the script narration; "
+                "earlier prompts must describe earlier visual moments."
+            )
+        else:
+            goal = (
+                f"Generate exactly {amount} distinct visual scene prompts covering "
+                "the most useful visible moments from the video script."
+            )
+            ordering_rule = ""
 
-## Goals:
+        prompt_kind_rules = f"""
+# Role: Visual Scene Prompt Generator
+
+## Goal
 {goal}
 
-## Constrains:
-1. the search terms are to be returned as a json-array of strings.
-2. each search term should consist of 1-3 words, always add the main subject of the video.
-3. you must only return the json-array of strings. you must not return anything else. you must not return the script.
-4. the search terms must be related to the subject of the video.
-5. reply with english search terms only.
+## Constraints
+1. Return ONLY one valid JSON array containing exactly {amount} strings.
+2. Each string must be a complete English visual prompt, normally 12-35 words long.
+3. Describe visible content: subject, action, environment, composition, lighting, and mood when useful.
+4. Prefer concrete visual details over abstract concepts, narration, explanations, or keywords.
+5. Do not add numbering, bullets, labels, markdown, or commentary inside or outside the JSON array.
+6. Do not force a global art style; style can be added later by the image/video generation template.
+7. When a character, object, vehicle, creature, or location recurs, repeat stable visible descriptors to improve continuity.
 {ordering_rule}
+9. Do not request on-screen text, captions, subtitles, logos, or watermarks unless the script specifically requires visible text.
+10. Use English for every visual prompt, even when the source script is in another language.
 
-## Output Example:
-{output_example}
-
-## Context:
+## Context
 ### Video Subject
 {video_subject}
 
 ### Video Script
 {video_script}
+""".strip()
+        prompt = prompt_kind_rules
+    else:
+        if match_script_order:
+            goal = (
+                f"Generate exactly {amount} chronological stock-video search terms that "
+                "follow the order of topics in the video script."
+            )
+            ordering_rule = (
+                "6. keep the terms in the same order as the script narration; "
+                "earlier terms must describe earlier visual moments."
+            )
+            example_terms = [
+                "opening visual topic",
+                *[f"script visual topic {index}" for index in range(2, max(amount, 1))],
+                "final visual topic",
+            ]
+            output_example = json.dumps(example_terms[:amount], ensure_ascii=False)
+        else:
+            goal = (
+                f"Generate exactly {amount} search terms for stock videos, depending on "
+                "the subject of a video."
+            )
+            ordering_rule = ""
+            output_example = json.dumps(
+                [f"search term {index}" for index in range(1, amount + 1)],
+                ensure_ascii=False,
+            )
 
-Please note that you must use English for generating video search terms; Chinese is not accepted.
+        prompt = f"""
+# Role: Video Search Terms Generator
+
+## Goals
+{goal}
+
+## Constraints
+1. Return ONLY one valid JSON array containing exactly {amount} strings.
+2. Each search term should consist of 1-3 words and remain suitable for stock-footage search.
+3. Do not return the script, markdown, numbering, explanations, or any text outside the JSON array.
+4. The search terms must be related to the subject and script.
+5. Use English search terms only.
+{ordering_rule}
+
+## Output Example
+{output_example}
+
+## Context
+### Video Subject
+{video_subject}
+
+### Video Script
+{video_script}
 """.strip()
 
-    logger.info(f"subject: {video_subject}, match_script_order: {match_script_order}")
+    logger.info(
+        f"subject: {video_subject}, match_script_order: {match_script_order}, "
+        f"visual_prompt_mode: {visual_prompt_mode}, amount: {amount}"
+    )
 
     search_terms = []
     response = ""
@@ -897,33 +1230,48 @@ Please note that you must use English for generating video search terms; Chinese
             else:
                 response = _generate_response(prompt, app_config=app_config)
             if response.startswith("Error: "):
-                # generate_terms 的公开返回类型是 List[str]。如果把 Provider 的
-                # 错误文案原样返回，下游只做空值判断时会把非空字符串误认为成功，
-                # 素材下载循环还会按字符遍历错误文案，产生无意义的外部请求。
-                # 这里统一返回空列表，让任务编排层在真实故障位置立即结束任务。
                 logger.error(f"failed to generate video terms: {response}")
                 return []
+
             search_terms = json.loads(_strip_code_fence(response))
             if not isinstance(search_terms, list) or not all(
                 isinstance(term, str) for term in search_terms
             ):
                 logger.error("response is not a list of strings.")
+                search_terms = []
                 continue
+
+            search_terms = [term.strip() for term in search_terms if term.strip()]
+            if len(search_terms) < amount:
+                logger.warning(
+                    "LLM returned fewer visual inputs than requested: "
+                    f"requested={amount}, received={len(search_terms)}"
+                )
+                search_terms = []
+                continue
+            if len(search_terms) > amount:
+                search_terms = search_terms[:amount]
 
         except Exception as e:
             logger.warning(f"failed to generate video terms: {str(e)}")
+            search_terms = []
             if response:
                 match = re.search(r"\[.*]", response, re.DOTALL)
                 if match:
                     try:
-                        search_terms = json.loads(match.group())
-                    except Exception as e:
-                        # 这里保留重试流程，但必须记录 LLM 返回的非标准 JSON，
-                        # 否则后续排查搜索词为空时无法定位
-                        # 是模型格式问题还是解析逻辑问题。
-                        logger.warning(f"failed to generate video terms: {str(e)}")
+                        recovered = json.loads(match.group())
+                        if isinstance(recovered, list) and all(
+                            isinstance(term, str) for term in recovered
+                        ):
+                            recovered = [term.strip() for term in recovered if term.strip()]
+                            if len(recovered) >= amount:
+                                search_terms = recovered[:amount]
+                    except Exception as recovery_error:
+                        logger.warning(
+                            f"failed to recover video terms JSON: {str(recovery_error)}"
+                        )
 
-        if search_terms and len(search_terms) > 0:
+        if len(search_terms) == amount:
             break
         if i < _max_retries - 1:
             logger.warning(f"failed to generate video terms, trying again... {i + 1}")
