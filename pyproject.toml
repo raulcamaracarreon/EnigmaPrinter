@@ -6,8 +6,8 @@ requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "moneyprinterturbo"
-version = "1.3.7"
+name = "enigmaprinter"
+version = "0.1.0.dev0"
 description = "Generate short videos from prompts, local assets, subtitles, and TTS."
 readme = "README-en.md"
 requires-python = ">=3.11"
