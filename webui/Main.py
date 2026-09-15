@@ -1149,6 +1149,12 @@ def _collect_task_summaries(limit=20):
 
 
 def _is_headless_server():
+    forced_headless = str(
+        os.environ.get("ENIGMAPRINTER_FORCE_HEADLESS", "")
+    ).strip().lower()
+    if forced_headless in {"1", "true", "yes", "on"}:
+        return True
+
     # Docker 或无桌面的服务器部署中，WebUI 进程接触不到用户的桌面环境：
     # xdg-open / webbrowser 只会在容器内静默失败。此时应改为浏览器内预览
     # 视频、以路径提示代替打开目录。macOS/Windows 桌面部署不受影响。
@@ -1168,6 +1174,7 @@ def _open_task_path(task_path):
     if _is_headless_server():
         # storage 目录通常以卷挂载映射回宿主机，提示相对路径即可定位文件。
         rel_path = os.path.relpath(normalized_path, os.path.dirname(tasks_root))
+        rel_path = rel_path.replace("\\", "/")
         st.toast(f"{tr('Open Task Folder')}: ./storage/{rel_path}", icon="📂")
         return
     webbrowser.open(f"file://{normalized_path}")

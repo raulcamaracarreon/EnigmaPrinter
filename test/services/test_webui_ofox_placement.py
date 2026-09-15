@@ -25,7 +25,12 @@ def test_ai_video_source_order_keeps_ofox_below_metaso():
     )
     groups = ast.literal_eval(assignment.value)
     assert groups["ai_video"] == (
-        "metaso_minimax", "ofox", "loomloom", "volcengine_seedance", "wavespeed"
+        "metaso_minimax",
+        "ofox",
+        "loomloom",
+        "volcengine_seedance",
+        "wavespeed",
+        "comfyui_video",
     )
     assert groups["stock_video"] == ("pexels", "pixabay", "coverr")
 
@@ -54,16 +59,17 @@ def test_ofox_settings_order_and_saved_values(language):
         keys = [item.key for item in app.text_input]
         assert keys.index("metaso_minimax_api_key_input") < keys.index("ofox_api_key_input")
         assert keys.index("ofox_api_key_input") < keys.index("loomloom_api_token_input")
-        # 获取密钥入口也要携带同一组跟踪参数，防止切换语言后丢失推广来源。
+        # EnigmaPrinter uses the official OFox URL without inherited tracking.
         api_key_input = next(item for item in app.text_input if item.key == "ofox_api_key_input")
-        assert "https://ofox.ai/?utm_source=github&utm_medium=sponsorship&utm_content=moneyprinterturbo" in api_key_input.label
+        assert "https://ofox.ai/" in api_key_input.label
+        assert "moneyprinterturbo" not in api_key_input.label.lower()
         assert any(item.value == "**OfoxAI**" for item in app.markdown)
-        # 每种语言均实际渲染，仅品牌名保留推广链接，官方上游说明使用普通文字。
+        # Every locale renders the official OFox brand link consistently.
         messages = json.loads((WEBUI.parent / "i18n" / f"{language}.json").read_text(encoding="utf-8"))
         help_text = messages["Translation"]["OFox AI Video Help"]
         assert "http" not in help_text
         assert any(
-            "[OfoxAI](https://ofox.ai/?utm_source=github&utm_medium=sponsorship&utm_content=moneyprinterturbo)" in item.value
+            "[OfoxAI](https://ofox.ai/)" in item.value
             and help_text in item.value
             for item in app.caption
         )

@@ -6,6 +6,7 @@ from threading import Event
 from unittest.mock import MagicMock, patch
 
 import requests
+from packaging.version import Version
 
 from app import __version__
 from app.services import version_checker
@@ -192,7 +193,10 @@ class TestProjectVersionMetadata(unittest.TestCase):
             (project_root / "pyproject.toml").read_text(encoding="utf-8")
         )
 
-        self.assertEqual(__version__, pyproject["project"]["version"])
+        self.assertEqual(
+            Version(__version__),
+            Version(pyproject["project"]["version"]),
+        )
 
 
 if __name__ == "__main__":

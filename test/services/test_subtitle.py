@@ -190,7 +190,7 @@ class TestSubtitleService(unittest.TestCase):
 
         self.assertEqual(
             [item[2] for item in items],
-            ["Expected sentence", "Extra sentence"],
+            ["Expected sentence.", "Extra sentence."],
         )
         self.assertEqual(items[1][1], "00:00:00,000 --> 00:00:00,000")
 

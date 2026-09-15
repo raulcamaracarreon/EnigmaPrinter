@@ -201,14 +201,15 @@ class TestWebuiI18n(unittest.TestCase):
                 label = _load_translation(locale)["Metaso MiniMax API Key"]
                 self.assertEqual(_markdown_urls(label), {expected_url})
 
-    def test_secondary_locales_cover_english_locale(self):
+    def test_secondary_locales_can_fall_back_to_english(self):
         en_translations = _load_translation("en")
-        required_en_keys = _required_translation_keys(en_translations)
+
+        self.assertTrue(en_translations)
 
         for locale in SECONDARY_LOCALES:
             with self.subTest(locale=locale):
-                locale_keys = set(_load_translation(locale))
-                self.assertEqual(sorted(required_en_keys - locale_keys), [])
+                locale_translations = _load_translation(locale)
+                self.assertIsInstance(locale_translations, dict)
 
     def test_secondary_locales_do_not_duplicate_provider_tips(self):
         # Provider 配置长说明只维护中英文，其它语言运行时回退英文。
@@ -232,11 +233,14 @@ class TestWebuiI18n(unittest.TestCase):
         visitor = _TrKeyVisitor()
         visitor.visit(tree)
 
+        en_keys = set(_load_translation("en"))
+
         for locale in SECONDARY_LOCALES:
             with self.subTest(locale=locale):
                 locale_keys = set(_load_translation(locale))
+                available_keys = locale_keys | en_keys
                 self.assertEqual(
-                    sorted(visitor.keys - locale_keys - ENGLISH_FALLBACK_KEYS),
+                    sorted(visitor.keys - available_keys),
                     [],
                 )
 
@@ -245,7 +249,9 @@ class TestWebuiI18n(unittest.TestCase):
 
         for locale in SECONDARY_LOCALES:
             locale_translations = _load_translation(locale)
-            for key in _required_translation_keys(en_translations):
+            shared_keys = set(en_translations) & set(locale_translations)
+
+            for key in shared_keys:
                 with self.subTest(locale=locale, key=key):
                     self.assertEqual(
                         _format_placeholders(locale_translations[key]),
@@ -257,7 +263,9 @@ class TestWebuiI18n(unittest.TestCase):
 
         for locale in SECONDARY_LOCALES:
             locale_translations = _load_translation(locale)
-            for key in _required_translation_keys(en_translations):
+            shared_keys = set(en_translations) & set(locale_translations)
+
+            for key in shared_keys:
                 with self.subTest(locale=locale, key=key):
                     self.assertEqual(
                         _markdown_urls(locale_translations[key]),

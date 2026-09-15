@@ -1,4 +1,3 @@
-import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,7 +25,7 @@ def headless_task_app(tmp_path, monkeypatch):
 
     monkeypatch.setattr(utils, "task_dir", lambda: str(tasks_dir))
     monkeypatch.setattr(sm.state, "get_all_tasks", lambda *_args, **_kwargs: ([], 0))
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("ENIGMAPRINTER_FORCE_HEADLESS", "1")
     monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
 

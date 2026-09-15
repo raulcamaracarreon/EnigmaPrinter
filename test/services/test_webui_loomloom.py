@@ -283,7 +283,11 @@ def test_generated_long_script_autofills_video_count_once_and_shows_shortfall():
         video_source="loomloom",
         loomloom_api_token="",
     )
-    test_ui_config = dict(config.ui, video_clip_duration=3)
+    test_ui_config = dict(
+        config.ui,
+        media_source_mode="single",
+        video_clip_duration=3,
+    )
 
     with (
         patch.object(config, "app", test_config),
@@ -345,7 +349,15 @@ def test_loomloom_video_source_quotes_then_passes_secret_in_confirmed_request():
     with (
         patch.object(config, "app", test_config),
         # 显式从两段切到一段，不能依赖开发者 config.toml 中的历史值。
-        patch.object(config, "ui", dict(config.ui, loomloom_video_scene_count=2)),
+        patch.object(
+            config,
+            "ui",
+            dict(
+                config.ui,
+                media_source_mode="single",
+                loomloom_video_scene_count=2,
+            ),
+        ),
         patch.object(config, "try_save_config", return_value=True),
         patch.object(
             loomloom.LoomLoomVideoBackend,
@@ -426,6 +438,11 @@ def test_loomloom_refresh_keeps_unavailable_selection_until_user_changes_it():
 
     with (
         patch.object(config, "app", test_config),
+        patch.object(
+            config,
+            "ui",
+            dict(config.ui, media_source_mode="single"),
+        ),
         patch.object(config, "try_save_config", return_value=True),
         patch.object(
             loomloom.LoomLoomVideoBackend,
@@ -475,6 +492,11 @@ def test_loomloom_zero_video_quote_warns_about_actual_charges():
 
     with (
         patch.object(config, "app", test_config),
+        patch.object(
+            config,
+            "ui",
+            dict(config.ui, media_source_mode="single"),
+        ),
         patch.object(config, "try_save_config", return_value=True),
         patch.object(
             loomloom.LoomLoomVideoBackend,

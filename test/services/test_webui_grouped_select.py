@@ -42,7 +42,11 @@ class _GroupedSelectHarness:
 def _running_app(harness, *, saved_video_source="pexels"):
     """在整个用例期间保持组件、配置和外部音色查询隔离。"""
     test_app_config = dict(config.app, video_source=saved_video_source)
-    test_ui_config = dict(config.ui, language="en")
+    test_ui_config = dict(
+        config.ui,
+        language="en",
+        media_source_mode="single",
+    )
     with (
         patch(
             "streamlit.components.v2.component",
@@ -123,7 +127,9 @@ def test_grouped_video_source_keeps_groups_and_accessible_label_binding():
             "loomloom",
             "volcengine_seedance",
             "wavespeed",
+            "comfyui_video",
             "openai_image",
+            "comfyui_t2i",
             "local",
         ]
 

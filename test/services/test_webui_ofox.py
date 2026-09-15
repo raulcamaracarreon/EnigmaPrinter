@@ -28,6 +28,11 @@ def test_ofox_source_requires_confirmation_then_submits_without_secret_in_params
     )
     with (
         patch.object(config, "app", test_config),
+        patch.object(
+            config,
+            "ui",
+            dict(config.ui, media_source_mode="single"),
+        ),
         patch.object(config, "try_save_config", return_value=True),
         patch("app.services.webui_task.submit_generation") as submit_generation,
     ):

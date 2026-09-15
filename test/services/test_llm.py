@@ -1518,6 +1518,7 @@ class TestLiteLLMProvider(unittest.TestCase):
             {
                 "model": "llama3",
                 "messages": [{"role": "user", "content": "Say hello"}],
+                "extra_body": {"reasoning_effort": "none"},
             },
         )
         self.assertEqual(result, "hello\nollama")

@@ -31,6 +31,11 @@ def test_metaso_source_requires_confirmation_and_never_enters_task_params():
     )
     with (
         patch.object(config, "app", test_config),
+        patch.object(
+            config,
+            "ui",
+            dict(config.ui, media_source_mode="single"),
+        ),
         patch.object(config, "try_save_config", return_value=True),
         patch("app.services.webui_task.submit_generation") as submit_generation,
     ):
@@ -108,7 +113,12 @@ def test_metaso_upload_voiceover_uses_actual_audio_billing_copy():
         metaso_minimax_api_key="metaso-secret",
         metaso_minimax_resolution="2K",
     )
-    test_ui = dict(config.ui, language="en", voice_mode="upload")
+    test_ui = dict(
+        config.ui,
+        language="en",
+        media_source_mode="single",
+        voice_mode="upload",
+    )
     with (
         patch.object(config, "app", test_config),
         patch.object(config, "ui", test_ui),
