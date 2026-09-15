@@ -71,16 +71,16 @@ from app.utils.logging_utils import configure_terminal_logger
 from app.utils import utils
 
 st.set_page_config(
-    page_title="MoneyPrinterTurbo",
+    page_title="EnigmaPrinter",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="auto",
     menu_items={
-        "Report a bug": "https://github.com/harry0703/MoneyPrinterTurbo/issues",
-        "About": "# MoneyPrinterTurbo\nSimply provide a topic or keyword for a video, and it will "
-        "automatically generate the video copy, video materials, video subtitles, "
-        "and video background music before synthesizing a high-definition short "
-        "video.\n\nhttps://github.com/harry0703/MoneyPrinterTurbo",
+        "Report a bug": "https://github.com/raulcamaracarreon/EnigmaPrinter/issues",
+        "About": "# EnigmaPrinter\nAudio-first AI video production. "
+        "Narration becomes the temporal authority of the workflow.\n\n"
+        "In the Beginning was the Word.\n\n"
+        "https://github.com/raulcamaracarreon/EnigmaPrinter",
     },
 )
 
@@ -237,10 +237,7 @@ VIDEO_SOURCE_GROUPS = {
 UPLOAD_POST_API_KEYS_URL = "https://app.upload-post.com/api-keys"
 UPLOAD_POST_MANAGE_USERS_URL = "https://app.upload-post.com/manage-users"
 # 素材设置与视频来源说明共用推广入口，避免两个位置的链接参数不一致。
-OFOX_REFERRAL_URL = (
-    "https://ofox.ai/?utm_source=github"
-    "&utm_medium=sponsorship&utm_content=moneyprinterturbo"
-)
+OFOX_REFERRAL_URL = "https://ofox.ai/"
 # “默认”是 WebUI 专用哨兵，不会写入 config.toml，也不会传给 FFmpeg。
 # 后端在 video_codec 未配置时继续采用稳定的 libx264；单独保留该哨兵可以区分
 # “跟随项目默认策略”和“用户明确固定 libx264”，便于未来安全调整默认策略。
@@ -1793,13 +1790,13 @@ def _render_brand(available_update: str | None = None):
     st.markdown(
         f"""
         <h1 class="mpt-brand">
-            <span class="mpt-brand__name">MoneyPrinterTurbo</span>
+            <span class="mpt-brand__name">EnigmaPrinter</span>
             <a class="mpt-brand__version"
-               href="https://github.com/harry0703/MoneyPrinterTurbo"
+               href="https://github.com/raulcamaracarreon/EnigmaPrinter"
                target="_blank"
                rel="noopener noreferrer"
-               aria-label="Open MoneyPrinterTurbo on GitHub"
-               title="Open project on GitHub">v{html.escape(str(config.project_version))}</a>
+               aria-label="Open EnigmaPrinter on GitHub"
+               title="Open EnigmaPrinter on GitHub">dev</a>
             {update_link}
         </h1>
         """,
@@ -1830,11 +1827,7 @@ def _render_top_bar():
         )
 
     with brand_col:
-        update_snapshot = version_checker.poll_available_update(config.project_version)
-        if update_snapshot.complete:
-            _render_brand(update_snapshot.available_version)
-        else:
-            _render_pending_version_check()
+        _render_brand()
 
     with actions_col:
         with st.container(
@@ -4332,7 +4325,7 @@ def _render_settings_dialog():
                 st.caption(
                     tr(
                         "Local text-to-video generation through ComfyUI using an exported API workflow. "
-                        "MoneyPrinterTurbo injects prompts and common size/seed fields; model-specific frame counts remain workflow-defined."
+                        "EnigmaPrinter injects prompts and common size/seed fields; model-specific frame counts remain workflow-defined."
                     )
                 )
 
@@ -4360,7 +4353,7 @@ def _render_settings_dialog():
                     value=str(
                         config.app.get("comfyui_video_workflow_path", "") or ""
                     ),
-                    placeholder=r"E:\MoneyPrinterTurbo\workflows\comfyui-t2v.json",
+                    placeholder=r"E:\EnigmaPrinter\workflows\comfyui-t2v.json",
                     help=tr("Use an API-format T2V workflow exported from ComfyUI"),
                     key="comfyui_video_workflow_path_input",
                 )
@@ -4545,7 +4538,7 @@ def _render_settings_dialog():
                         )
                         or ""
                     ),
-                    placeholder=r"E:\MoneyPrinterTurbo\mage-flowT2I.json",
+                    placeholder=r"E:\EnigmaPrinter\mage-flowT2I.json",
                     help=tr("Use an API-format workflow exported from ComfyUI"),
                     key="comfyui_t2i_workflow_path_input",
                 )
