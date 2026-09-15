@@ -1,3 +1,3 @@
-"""MoneyPrinterTurbo 应用包元数据。"""
+"""EnigmaPrinter application package metadata."""
 
-__version__ = "1.3.7"
+__version__ = "0.1.0-dev"
