@@ -304,8 +304,8 @@ Repeat
 Clone this repository if you specifically want the EnigmaPrinter development branch and its audio-first, visual-planning, and hybrid-media features:
 
 ```bash
-git clone https://github.com/raulcamaracarreon/MoneyPrinterTurbo-AudioFirst.git
-cd MoneyPrinterTurbo-AudioFirst
+git clone https://github.com/raulcamaracarreon/EnigmaPrinter.git
+cd EnigmaPrinter
 ```
 
 Python **3.11+** is required by the inherited MoneyPrinterTurbo codebase.
