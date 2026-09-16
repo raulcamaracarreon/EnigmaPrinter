@@ -195,7 +195,6 @@
     "Single Word (Word by Word)": "Word by word",
     "Word-by-word Timing Help": "Word-by-word timing is most accurate with Azure TTS V1 (Edge TTS) or Whisper. Other voice providers may fall back to phrase or sentence timing.",
     "Subtitle Animation": "Entrance animation",
-    "None": "None",
     "Pop Up (Spring)": "Spring pop",
     "Custom": "Custom",
     "Custom Position (% from top)": "Custom Position (% from top)",
@@ -632,6 +631,11 @@
     "{count} active shots still use an internal duration-limit cut because no validated narration/alignment boundary was available at a safe position.": "{count} active shots still use an internal duration-limit cut because no validated narration/alignment boundary was available at a safe position.",
     "Voiceover Pitch": "Voice Pitch (Edge TTS)",
     "Voiceover Pitch Help": "Edge TTS only. Negative values make the voice deeper; positive values make it higher. 0 Hz keeps the original pitch.",
-    "Voiceover Pitch Scale": "Deeper ← 0 Hz → Higher"
+    "Voiceover Pitch Scale": "Deeper ← 0 Hz → Higher",
+    "Analyze Uploaded Narration": "Analyze Uploaded Narration",
+    "Analyze Uploaded Narration Help": "Align the uploaded voiceover to the current script and build the same Narration Timeline, Semantic Scene Timeline, and Active Shot Plan used by internal TTS.",
+    "Analyzing Uploaded Narration": "Analyzing Uploaded Narration",
+    "Uploaded Narration Alignment Failed": "Uploaded narration alignment failed: {error}",
+    "Uploaded Narration Alignment Summary": "Uploaded narration aligned: {matched}/{script} script words matched ({coverage:.0%}); {recognized_coverage:.0%} of recognized speech belongs to the script."
   }
 }

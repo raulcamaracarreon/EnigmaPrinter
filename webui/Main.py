@@ -50,6 +50,7 @@ from app.services import (
     loomloom,
     material,
     metaso_minimax,
+    narration_alignment,
     narration_timeline,
     visual_timeline,
     media_shot_plan,
@@ -7002,632 +7003,637 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
             else:
                 st.warning(tr("Voice Preview Duration Unavailable"))
 
-            timeline = cached_preview.get("narration_timeline")
-            if isinstance(timeline, dict) and timeline.get("segments"):
-                timing_source = str(timeline.get("timing_source") or "estimated")
-                source_labels = {
-                    "native": tr("Native timing"),
-                    "derived": tr("Derived timing"),
-                    "estimated": tr("Estimated timing"),
-                }
-                st.caption(
-                    tr("Narration Timeline Timing Source").format(
-                        source=source_labels.get(timing_source, timing_source)
-                    )
+            _render_audio_first_timeline_plan(params, cached_preview)
+
+
+def _render_audio_first_timeline_plan(params, cached_preview):
+    """Render the shared audio-first planning chain for any timed narration."""
+    timeline = cached_preview.get("narration_timeline")
+    if isinstance(timeline, dict) and timeline.get("segments"):
+        timing_source = str(timeline.get("timing_source") or "estimated")
+        source_labels = {
+            "native": tr("Native timing"),
+            "derived": tr("Derived timing"),
+            "estimated": tr("Estimated timing"),
+        }
+        st.caption(
+            tr("Narration Timeline Timing Source").format(
+                source=source_labels.get(timing_source, timing_source)
+            )
+        )
+        alignment_unit_count = len(timeline.get("alignment_units", []) or [])
+        if alignment_unit_count:
+            st.caption(
+                tr("Fine Alignment Units: {count}").format(
+                    count=alignment_unit_count
                 )
-                alignment_unit_count = len(timeline.get("alignment_units", []) or [])
-                if alignment_unit_count:
-                    st.caption(
-                        tr("Fine Alignment Units: {count}").format(
-                            count=alignment_unit_count
-                        )
-                    )
-                with st.expander(tr("Narration Timeline"), expanded=False):
-                    rows = []
-                    for segment in timeline.get("segments", []):
+            )
+        with st.expander(tr("Narration Timeline"), expanded=False):
+            rows = []
+            for segment in timeline.get("segments", []):
+                try:
+                    start = float(segment.get("start", 0.0))
+                    end = float(segment.get("end", start))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                rows.append(
+                    {
+                        "#": segment.get("index", len(rows) + 1),
+                        tr("Start"): round(start, 2),
+                        tr("End"): round(end, 2),
+                        tr("Duration"): round(max(0.0, end - start), 2),
+                        tr("Narration Text"): segment.get("text", ""),
+                    }
+                )
+            if rows:
+                st.dataframe(rows, hide_index=True, use_container_width=True)
+
+        # Audio-first phase 2 deliberately separates story semantics from media
+        # duration limits. Semantic scenes depend only on narration structure;
+        # Clip Duration is applied afterwards as a hard maximum for media shots.
+        try:
+            semantic_timeline = visual_timeline.build_visual_timeline(timeline)
+            shot_plan = media_shot_plan.build_media_shot_plan(
+                semantic_timeline,
+                max_clip_duration=float(params.video_clip_duration or 5),
+            )
+        except (TypeError, ValueError) as exc:
+            logger.warning(f"could not build visual media plan preview: {exc}")
+        else:
+            semantic_data = semantic_timeline.to_dict()
+            scene_segments = semantic_data.get("segments", [])
+            shot_data = shot_plan.to_dict()
+            shots = shot_data.get("shots", [])
+
+            if scene_segments:
+                st.caption(
+                    tr(
+                        "Semantic Scenes: {count}. These boundaries are independent of Clip Duration."
+                    ).format(count=len(scene_segments))
+                )
+                with st.expander(tr("Semantic Scene Timeline"), expanded=False):
+                    scene_rows = []
+                    for scene in scene_segments:
                         try:
-                            start = float(segment.get("start", 0.0))
-                            end = float(segment.get("end", start))
+                            start = float(scene.get("start", 0.0))
+                            end = float(scene.get("end", start))
                         except (TypeError, ValueError, OverflowError):
                             continue
-                        rows.append(
+                        source_indices = list(scene.get("narration_indices", []) or [])
+                        if source_indices:
+                            first_source = source_indices[0]
+                            last_source = source_indices[-1]
+                            narration_range = (
+                                str(first_source)
+                                if first_source == last_source
+                                else f"{first_source}–{last_source}"
+                            )
+                        else:
+                            narration_range = ""
+                        scene_rows.append(
                             {
-                                "#": segment.get("index", len(rows) + 1),
+                                tr("Scene"): scene.get("index", len(scene_rows) + 1),
                                 tr("Start"): round(start, 2),
                                 tr("End"): round(end, 2),
                                 tr("Duration"): round(max(0.0, end - start), 2),
-                                tr("Narration Text"): segment.get("text", ""),
+                                tr("Narration Units"): narration_range,
+                                tr("Narration Text"): scene.get("narration_text", ""),
                             }
                         )
-                    if rows:
-                        st.dataframe(rows, hide_index=True, use_container_width=True)
+                    if scene_rows:
+                        st.dataframe(
+                            scene_rows, hide_index=True, use_container_width=True
+                        )
 
-                # Audio-first phase 2 deliberately separates story semantics from media
-                # duration limits. Semantic scenes depend only on narration structure;
-                # Clip Duration is applied afterwards as a hard maximum for media shots.
+            if shots:
+                maximum = float(shot_data.get("max_clip_duration", 5.0))
+                minimum = float(
+                    shot_data.get(
+                        "min_clip_duration",
+                        min(
+                            media_shot_plan.DEFAULT_MINIMUM_SHOT_DURATION,
+                            maximum,
+                        ),
+                    )
+                )
+
+                # There is exactly one shot plan that matters downstream: the Active Shot Plan.
+                # Start with the deterministic plan and replace it only when a current, validated
+                # AI refinement exists. The original and refined plans are no longer presented as
+                # two competing tables that the user has to reconcile manually.
+                active_shot_plan = shot_plan
+                active_shot_data = shot_data
+                active_plan_source = "automatic"
+                active_refinement_summary = None
+
                 try:
-                    semantic_timeline = visual_timeline.build_visual_timeline(timeline)
-                    shot_plan = media_shot_plan.build_media_shot_plan(
-                        semantic_timeline,
-                        max_clip_duration=float(params.video_clip_duration or 5),
+                    refinement_candidates = (
+                        media_shot_refinement.build_refinement_candidates(
+                            semantic_timeline, shot_plan
+                        )
                     )
                 except (TypeError, ValueError) as exc:
-                    logger.warning(f"could not build visual media plan preview: {exc}")
-                else:
-                    semantic_data = semantic_timeline.to_dict()
-                    scene_segments = semantic_data.get("segments", [])
-                    shot_data = shot_plan.to_dict()
-                    shots = shot_data.get("shots", [])
+                    logger.warning(
+                        f"could not build AI shot refinement candidates: {exc}"
+                    )
+                    refinement_candidates = []
 
-                    if scene_segments:
-                        st.caption(
-                            tr(
-                                "Semantic Scenes: {count}. These boundaries are independent of Clip Duration."
-                            ).format(count=len(scene_segments))
-                        )
-                        with st.expander(tr("Semantic Scene Timeline"), expanded=False):
-                            scene_rows = []
-                            for scene in scene_segments:
-                                try:
-                                    start = float(scene.get("start", 0.0))
-                                    end = float(scene.get("end", start))
-                                except (TypeError, ValueError, OverflowError):
-                                    continue
-                                source_indices = list(scene.get("narration_indices", []) or [])
-                                if source_indices:
-                                    first_source = source_indices[0]
-                                    last_source = source_indices[-1]
-                                    narration_range = (
-                                        str(first_source)
-                                        if first_source == last_source
-                                        else f"{first_source}–{last_source}"
-                                    )
-                                else:
-                                    narration_range = ""
-                                scene_rows.append(
-                                    {
-                                        tr("Scene"): scene.get("index", len(scene_rows) + 1),
-                                        tr("Start"): round(start, 2),
-                                        tr("End"): round(end, 2),
-                                        tr("Duration"): round(max(0.0, end - start), 2),
-                                        tr("Narration Units"): narration_range,
-                                        tr("Narration Text"): scene.get("narration_text", ""),
-                                    }
-                                )
-                            if scene_rows:
-                                st.dataframe(
-                                    scene_rows, hide_index=True, use_container_width=True
-                                )
+                if refinement_candidates:
+                    refinement_fingerprint_payload = {
+                        "semantic_timeline": semantic_data,
+                        "shot_plan": shot_data,
+                    }
+                    refinement_fingerprint = hashlib.sha256(
+                        json.dumps(
+                            refinement_fingerprint_payload,
+                            sort_keys=True,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
 
-                    if shots:
-                        maximum = float(shot_data.get("max_clip_duration", 5.0))
-                        minimum = float(
-                            shot_data.get(
-                                "min_clip_duration",
-                                min(
-                                    media_shot_plan.DEFAULT_MINIMUM_SHOT_DURATION,
-                                    maximum,
-                                ),
-                            )
-                        )
-
-                        # There is exactly one shot plan that matters downstream: the Active Shot Plan.
-                        # Start with the deterministic plan and replace it only when a current, validated
-                        # AI refinement exists. The original and refined plans are no longer presented as
-                        # two competing tables that the user has to reconcile manually.
-                        active_shot_plan = shot_plan
-                        active_shot_data = shot_data
-                        active_plan_source = "automatic"
-                        active_refinement_summary = None
-
+                    st.caption(
+                        tr(
+                            "Optional AI refinement can review {count} uncertain internal cuts. "
+                            "It may only choose existing validated boundaries; timing coverage, "
+                            "shot count, order, preferred minimum, and hard maximum remain constrained."
+                        ).format(count=len(refinement_candidates))
+                    )
+                    if st.button(
+                        tr("Refine Active Shot Plan with AI"),
+                        key="refine_media_shot_plan_with_ai",
+                        use_container_width=True,
+                        type="secondary",
+                        icon=":material/auto_awesome:",
+                    ):
                         try:
-                            refinement_candidates = (
-                                media_shot_refinement.build_refinement_candidates(
-                                    semantic_timeline, shot_plan
-                                )
-                            )
-                        except (TypeError, ValueError) as exc:
-                            logger.warning(
-                                f"could not build AI shot refinement candidates: {exc}"
-                            )
-                            refinement_candidates = []
-
-                        if refinement_candidates:
-                            refinement_fingerprint_payload = {
-                                "semantic_timeline": semantic_data,
-                                "shot_plan": shot_data,
-                            }
-                            refinement_fingerprint = hashlib.sha256(
-                                json.dumps(
-                                    refinement_fingerprint_payload,
-                                    sort_keys=True,
-                                    ensure_ascii=False,
-                                    separators=(",", ":"),
-                                ).encode("utf-8")
-                            ).hexdigest()
-
-                            st.caption(
-                                tr(
-                                    "Optional AI refinement can review {count} uncertain internal cuts. "
-                                    "It may only choose existing validated boundaries; timing coverage, "
-                                    "shot count, order, preferred minimum, and hard maximum remain constrained."
-                                ).format(count=len(refinement_candidates))
-                            )
-                            if st.button(
-                                tr("Refine Active Shot Plan with AI"),
-                                key="refine_media_shot_plan_with_ai",
-                                use_container_width=True,
-                                type="secondary",
-                                icon=":material/auto_awesome:",
-                            ):
-                                try:
-                                    with st.spinner(tr("Refining Active Shot Plan")):
-                                        refinement_result = _run_llm_read_operation(
-                                            "refine_media_shot_plan",
-                                            lambda app_config_snapshot: (
-                                                media_shot_refinement.refine_media_shot_plan(
-                                                    semantic_timeline,
-                                                    shot_plan,
-                                                    response_generator=lambda prompt: llm._generate_response(
-                                                        prompt=prompt,
-                                                        app_config=app_config_snapshot,
-                                                    ),
-                                                )
+                            with st.spinner(tr("Refining Active Shot Plan")):
+                                refinement_result = _run_llm_read_operation(
+                                    "refine_media_shot_plan",
+                                    lambda app_config_snapshot: (
+                                        media_shot_refinement.refine_media_shot_plan(
+                                            semantic_timeline,
+                                            shot_plan,
+                                            response_generator=lambda prompt: llm._generate_response(
+                                                prompt=prompt,
+                                                app_config=app_config_snapshot,
                                             ),
                                         )
-                                except Exception as exc:
-                                    logger.exception("AI media shot refinement failed")
-                                    st.warning(
-                                        tr("AI Shot Refinement Failed").format(
-                                            error=str(exc)
-                                        )
-                                    )
-                                else:
-                                    st.session_state["media_shot_refinement_preview"] = {
-                                        "fingerprint": refinement_fingerprint,
-                                        "result": refinement_result.to_dict(),
-                                    }
-                                    # A changed shot plan invalidates every downstream visual/media plan.
-                                    st.session_state.pop("visual_shot_plan_preview", None)
-                                    st.session_state.pop("media_plan_preview", None)
-                                    st.session_state.pop(
-                                        "applied_visual_shot_plan_fingerprint", None
-                                    )
-                                    st.session_state.pop(
-                                        "applied_visual_shot_plan_voice_fingerprint", None
-                                    )
-
-                            cached_refinement = st.session_state.get(
-                                "media_shot_refinement_preview"
+                                    ),
+                                )
+                        except Exception as exc:
+                            logger.exception("AI media shot refinement failed")
+                            st.warning(
+                                tr("AI Shot Refinement Failed").format(
+                                    error=str(exc)
+                                )
                             )
-                            if (
-                                isinstance(cached_refinement, dict)
-                                and cached_refinement.get("fingerprint")
-                                == refinement_fingerprint
-                                and isinstance(cached_refinement.get("result"), dict)
-                            ):
-                                refined_result = cached_refinement["result"]
-                                refined_plan = refined_result.get("plan", {}) or {}
-                                refined_shots = list(refined_plan.get("shots", []) or [])
-                                # The refinement service guarantees the same shot count and rebuilds
-                                # through the deterministic validator. Keep a defensive UI check too.
-                                if refined_shots and len(refined_shots) == len(shots):
-                                    active_shot_plan = refined_plan
-                                    active_shot_data = refined_plan
-                                    active_plan_source = "ai_refined"
-                                    active_refinement_summary = tr(
-                                        "AI reviewed {eligible} candidate scenes and changed {refined}; "
-                                        "rejected choices: {rejected}."
-                                    ).format(
-                                        eligible=refined_result.get(
-                                            "eligible_scene_count", 0
-                                        ),
-                                        refined=refined_result.get(
-                                            "refined_scene_count", 0
-                                        ),
-                                        rejected=refined_result.get(
-                                            "rejected_choice_count", 0
-                                        ),
-                                    )
-
-                                    if st.button(
-                                        tr("Use Automatic Shot Plan"),
-                                        key="discard_media_shot_plan_refinement",
-                                        use_container_width=True,
-                                        help=tr(
-                                            "Discard the current AI refinement and return the deterministic Media Shot Plan to Active Shot Plan."
-                                        ),
-                                    ):
-                                        st.session_state.pop(
-                                            "media_shot_refinement_preview", None
-                                        )
-                                        st.session_state.pop(
-                                            "visual_shot_plan_preview", None
-                                        )
-                                        st.session_state.pop("media_plan_preview", None)
-                                        st.session_state.pop(
-                                            "applied_visual_shot_plan_fingerprint", None
-                                        )
-                                        st.session_state.pop(
-                                            "applied_visual_shot_plan_voice_fingerprint",
-                                            None,
-                                        )
-                                        st.rerun()
-
-                        active_shots = list(active_shot_data.get("shots", []) or [])
-                        active_maximum = float(
-                            active_shot_data.get("max_clip_duration", maximum) or maximum
-                        )
-                        active_minimum = float(
-                            active_shot_data.get("min_clip_duration", minimum) or minimum
-                        )
-                        active_undersized_count = int(
-                            active_shot_data.get("undersized_shot_count", 0) or 0
-                        )
-                        active_estimated_cut_count = sum(
-                            1
-                            for shot in active_shots
-                            if shot.get("uses_internal_estimate")
-                        )
-
-                        source_label = (
-                            tr("AI-Refined")
-                            if active_plan_source == "ai_refined"
-                            else tr("Automatic")
-                        )
-                        st.caption(
-                            tr(
-                                "Active Shot Plan: {source} · {count} shots · preferred minimum "
-                                "{minimum:.1f}s · hard maximum {maximum:.1f}s."
-                            ).format(
-                                source=source_label,
-                                count=len(active_shots),
-                                minimum=active_minimum,
-                                maximum=active_maximum,
-                            )
-                        )
-                        if active_refinement_summary:
-                            st.caption(active_refinement_summary)
-                        if active_undersized_count:
-                            st.caption(
-                                tr(
-                                    "{count} active shots remain below the preferred minimum because "
-                                    "no safe boundary adjustment can remove them without breaking the hard maximum."
-                                ).format(count=active_undersized_count)
-                            )
-                        if active_estimated_cut_count:
-                            st.caption(
-                                tr(
-                                    "{count} active shots still use an internal duration-limit cut because "
-                                    "no validated narration/alignment boundary was available at a safe position."
-                                ).format(count=active_estimated_cut_count)
-                            )
-
-                        with st.expander(tr("Active Shot Plan"), expanded=False):
-                            active_rows = []
-                            for active_shot in active_shots:
-                                try:
-                                    active_start = float(
-                                        active_shot.get("start", 0.0)
-                                    )
-                                    active_end = float(
-                                        active_shot.get("end", active_start)
-                                    )
-                                except (
-                                    TypeError,
-                                    ValueError,
-                                    OverflowError,
-                                ):
-                                    continue
-                                active_scene_indices = list(
-                                    active_shot.get("scene_indices", [])
-                                    or [active_shot.get("scene_index", "")]
-                                )
-                                active_scene_indices = [
-                                    value
-                                    for value in active_scene_indices
-                                    if value != ""
-                                ]
-                                if active_scene_indices:
-                                    first_active_scene = active_scene_indices[0]
-                                    last_active_scene = active_scene_indices[-1]
-                                    active_scene_range = (
-                                        str(first_active_scene)
-                                        if first_active_scene == last_active_scene
-                                        else f"{first_active_scene}–{last_active_scene}"
-                                    )
-                                else:
-                                    active_scene_range = ""
-
-                                active_narration_indices = list(
-                                    active_shot.get("narration_indices", []) or []
-                                )
-                                if active_narration_indices:
-                                    first_active_narration = active_narration_indices[0]
-                                    last_active_narration = active_narration_indices[-1]
-                                    active_narration_range = (
-                                        str(first_active_narration)
-                                        if first_active_narration
-                                        == last_active_narration
-                                        else f"{first_active_narration}–{last_active_narration}"
-                                    )
-                                else:
-                                    active_narration_range = ""
-
-                                active_end_source = str(
-                                    active_shot.get("end_boundary_source")
-                                    or "scene_boundary"
-                                )
-                                active_cut_label = {
-                                    "scene_boundary": tr("Scene boundary"),
-                                    "narration_boundary": tr("Narration boundary"),
-                                    "alignment_boundary": tr("Aligned boundary"),
-                                    "balanced_internal_cut": tr("Duration-limit cut"),
-                                }.get(active_end_source, active_end_source)
-                                active_rows.append(
-                                    {
-                                        "#": active_shot.get(
-                                            "index", len(active_rows) + 1
-                                        ),
-                                        tr("Scene"): active_scene_range,
-                                        tr("Start"): round(active_start, 2),
-                                        tr("End"): round(active_end, 2),
-                                        tr("Duration"): round(
-                                            max(0.0, active_end - active_start),
-                                            2,
-                                        ),
-                                        tr("End Cut"): active_cut_label,
-                                        tr("Narration Units"): active_narration_range,
-                                        tr("Narration Text"): active_shot.get(
-                                            "narration_text", ""
-                                        ),
-                                    }
-                                )
-                            if active_rows:
-                                st.dataframe(
-                                    active_rows,
-                                    hide_index=True,
-                                    use_container_width=True,
-                                )
-
-                        # The Active Shot Plan is the only timing plan handed to the visual layer.
-                        # Generating visual prompts also applies them immediately, removing the former
-                        # "Generate Visual Shot Plan" -> table -> "Use as Visual Prompts" ceremony.
-                        if _uses_ai_visual_prompts(params.video_source):
-                            visual_plan_fingerprint_payload = {
-                                "shot_plan": active_shot_data,
-                                "video_subject": str(
-                                    params.video_subject or ""
-                                ).strip(),
+                        else:
+                            st.session_state["media_shot_refinement_preview"] = {
+                                "fingerprint": refinement_fingerprint,
+                                "result": refinement_result.to_dict(),
                             }
-                            visual_plan_fingerprint = hashlib.sha256(
-                                json.dumps(
-                                    visual_plan_fingerprint_payload,
-                                    sort_keys=True,
-                                    ensure_ascii=False,
-                                    separators=(",", ":"),
-                                ).encode("utf-8")
-                            ).hexdigest()
-
-                            try:
-                                visual_payload = (
-                                    visual_shot_planner.build_visual_shot_payload(
-                                        active_shot_plan
-                                    )
-                                )
-                            except (TypeError, ValueError) as exc:
-                                logger.warning(
-                                    f"could not build visual shot planner payload: {exc}"
-                                )
-                                visual_payload = []
-
-                            # Any previously applied plan belongs to another Active Shot Plan when
-                            # its fingerprint differs. Invalidate it before Generate Video can reuse
-                            # stale timing.
-                            applied_visual_fingerprint = str(
-                                st.session_state.get(
-                                    "applied_visual_shot_plan_fingerprint", ""
-                                )
-                                or ""
+                            # A changed shot plan invalidates every downstream visual/media plan.
+                            st.session_state.pop("visual_shot_plan_preview", None)
+                            st.session_state.pop("media_plan_preview", None)
+                            st.session_state.pop(
+                                "applied_visual_shot_plan_fingerprint", None
                             )
-                            if (
-                                applied_visual_fingerprint
-                                and applied_visual_fingerprint
-                                != visual_plan_fingerprint
+                            st.session_state.pop(
+                                "applied_visual_shot_plan_voice_fingerprint", None
+                            )
+
+                    cached_refinement = st.session_state.get(
+                        "media_shot_refinement_preview"
+                    )
+                    if (
+                        isinstance(cached_refinement, dict)
+                        and cached_refinement.get("fingerprint")
+                        == refinement_fingerprint
+                        and isinstance(cached_refinement.get("result"), dict)
+                    ):
+                        refined_result = cached_refinement["result"]
+                        refined_plan = refined_result.get("plan", {}) or {}
+                        refined_shots = list(refined_plan.get("shots", []) or [])
+                        # The refinement service guarantees the same shot count and rebuilds
+                        # through the deterministic validator. Keep a defensive UI check too.
+                        if refined_shots and len(refined_shots) == len(shots):
+                            active_shot_plan = refined_plan
+                            active_shot_data = refined_plan
+                            active_plan_source = "ai_refined"
+                            active_refinement_summary = tr(
+                                "AI reviewed {eligible} candidate scenes and changed {refined}; "
+                                "rejected choices: {rejected}."
+                            ).format(
+                                eligible=refined_result.get(
+                                    "eligible_scene_count", 0
+                                ),
+                                refined=refined_result.get(
+                                    "refined_scene_count", 0
+                                ),
+                                rejected=refined_result.get(
+                                    "rejected_choice_count", 0
+                                ),
+                            )
+
+                            if st.button(
+                                tr("Use Automatic Shot Plan"),
+                                key="discard_media_shot_plan_refinement",
+                                use_container_width=True,
+                                help=tr(
+                                    "Discard the current AI refinement and return the deterministic Media Shot Plan to Active Shot Plan."
+                                ),
                             ):
+                                st.session_state.pop(
+                                    "media_shot_refinement_preview", None
+                                )
+                                st.session_state.pop(
+                                    "visual_shot_plan_preview", None
+                                )
+                                st.session_state.pop("media_plan_preview", None)
                                 st.session_state.pop(
                                     "applied_visual_shot_plan_fingerprint", None
                                 )
                                 st.session_state.pop(
-                                    "applied_visual_shot_plan_voice_fingerprint", None
+                                    "applied_visual_shot_plan_voice_fingerprint",
+                                    None,
                                 )
-                                st.session_state.pop("media_plan_preview", None)
+                                st.rerun()
 
-                            if visual_payload:
-                                shared_narration_count = sum(
-                                    1
-                                    for item in visual_payload
-                                    if item.get("shared_narration_with_previous")
-                                )
-                                st.caption(
+                active_shots = list(active_shot_data.get("shots", []) or [])
+                active_maximum = float(
+                    active_shot_data.get("max_clip_duration", maximum) or maximum
+                )
+                active_minimum = float(
+                    active_shot_data.get("min_clip_duration", minimum) or minimum
+                )
+                active_undersized_count = int(
+                    active_shot_data.get("undersized_shot_count", 0) or 0
+                )
+                active_estimated_cut_count = sum(
+                    1
+                    for shot in active_shots
+                    if shot.get("uses_internal_estimate")
+                )
+
+                source_label = (
+                    tr("AI-Refined")
+                    if active_plan_source == "ai_refined"
+                    else tr("Automatic")
+                )
+                st.caption(
+                    tr(
+                        "Active Shot Plan: {source} · {count} shots · preferred minimum "
+                        "{minimum:.1f}s · hard maximum {maximum:.1f}s."
+                    ).format(
+                        source=source_label,
+                        count=len(active_shots),
+                        minimum=active_minimum,
+                        maximum=active_maximum,
+                    )
+                )
+                if active_refinement_summary:
+                    st.caption(active_refinement_summary)
+                if active_undersized_count:
+                    st.caption(
+                        tr(
+                            "{count} active shots remain below the preferred minimum because "
+                            "no safe boundary adjustment can remove them without breaking the hard maximum."
+                        ).format(count=active_undersized_count)
+                    )
+                if active_estimated_cut_count:
+                    st.caption(
+                        tr(
+                            "{count} active shots still use an internal duration-limit cut because "
+                            "no validated narration/alignment boundary was available at a safe position."
+                        ).format(count=active_estimated_cut_count)
+                    )
+
+                with st.expander(tr("Active Shot Plan"), expanded=False):
+                    active_rows = []
+                    for active_shot in active_shots:
+                        try:
+                            active_start = float(
+                                active_shot.get("start", 0.0)
+                            )
+                            active_end = float(
+                                active_shot.get("end", active_start)
+                            )
+                        except (
+                            TypeError,
+                            ValueError,
+                            OverflowError,
+                        ):
+                            continue
+                        active_scene_indices = list(
+                            active_shot.get("scene_indices", [])
+                            or [active_shot.get("scene_index", "")]
+                        )
+                        active_scene_indices = [
+                            value
+                            for value in active_scene_indices
+                            if value != ""
+                        ]
+                        if active_scene_indices:
+                            first_active_scene = active_scene_indices[0]
+                            last_active_scene = active_scene_indices[-1]
+                            active_scene_range = (
+                                str(first_active_scene)
+                                if first_active_scene == last_active_scene
+                                else f"{first_active_scene}–{last_active_scene}"
+                            )
+                        else:
+                            active_scene_range = ""
+
+                        active_narration_indices = list(
+                            active_shot.get("narration_indices", []) or []
+                        )
+                        if active_narration_indices:
+                            first_active_narration = active_narration_indices[0]
+                            last_active_narration = active_narration_indices[-1]
+                            active_narration_range = (
+                                str(first_active_narration)
+                                if first_active_narration
+                                == last_active_narration
+                                else f"{first_active_narration}–{last_active_narration}"
+                            )
+                        else:
+                            active_narration_range = ""
+
+                        active_end_source = str(
+                            active_shot.get("end_boundary_source")
+                            or "scene_boundary"
+                        )
+                        active_cut_label = {
+                            "scene_boundary": tr("Scene boundary"),
+                            "narration_boundary": tr("Narration boundary"),
+                            "alignment_boundary": tr("Aligned boundary"),
+                            "balanced_internal_cut": tr("Duration-limit cut"),
+                        }.get(active_end_source, active_end_source)
+                        active_rows.append(
+                            {
+                                "#": active_shot.get(
+                                    "index", len(active_rows) + 1
+                                ),
+                                tr("Scene"): active_scene_range,
+                                tr("Start"): round(active_start, 2),
+                                tr("End"): round(active_end, 2),
+                                tr("Duration"): round(
+                                    max(0.0, active_end - active_start),
+                                    2,
+                                ),
+                                tr("End Cut"): active_cut_label,
+                                tr("Narration Units"): active_narration_range,
+                                tr("Narration Text"): active_shot.get(
+                                    "narration_text", ""
+                                ),
+                            }
+                        )
+                    if active_rows:
+                        st.dataframe(
+                            active_rows,
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
+                # The Active Shot Plan is the only timing plan handed to the visual layer.
+                # Generating visual prompts also applies them immediately, removing the former
+                # "Generate Visual Shot Plan" -> table -> "Use as Visual Prompts" ceremony.
+                if _uses_ai_visual_prompts(params.video_source):
+                    visual_plan_fingerprint_payload = {
+                        "shot_plan": active_shot_data,
+                        "video_subject": str(
+                            params.video_subject or ""
+                        ).strip(),
+                    }
+                    visual_plan_fingerprint = hashlib.sha256(
+                        json.dumps(
+                            visual_plan_fingerprint_payload,
+                            sort_keys=True,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+
+                    try:
+                        visual_payload = (
+                            visual_shot_planner.build_visual_shot_payload(
+                                active_shot_plan
+                            )
+                        )
+                    except (TypeError, ValueError) as exc:
+                        logger.warning(
+                            f"could not build visual shot planner payload: {exc}"
+                        )
+                        visual_payload = []
+
+                    # Any previously applied plan belongs to another Active Shot Plan when
+                    # its fingerprint differs. Invalidate it before Generate Video can reuse
+                    # stale timing.
+                    applied_visual_fingerprint = str(
+                        st.session_state.get(
+                            "applied_visual_shot_plan_fingerprint", ""
+                        )
+                        or ""
+                    )
+                    if (
+                        applied_visual_fingerprint
+                        and applied_visual_fingerprint
+                        != visual_plan_fingerprint
+                    ):
+                        st.session_state.pop(
+                            "applied_visual_shot_plan_fingerprint", None
+                        )
+                        st.session_state.pop(
+                            "applied_visual_shot_plan_voice_fingerprint", None
+                        )
+                        st.session_state.pop("media_plan_preview", None)
+
+                    if visual_payload:
+                        shared_narration_count = sum(
+                            1
+                            for item in visual_payload
+                            if item.get("shared_narration_with_previous")
+                        )
+                        st.caption(
+                            tr(
+                                "Generate one unique visual prompt for each of the {count} Active Shot Plan windows. "
+                                "{shared} shots continue narration already present in the previous shot. "
+                                "The generated prompts are applied to Visual Prompts automatically."
+                            ).format(
+                                count=len(visual_payload),
+                                shared=shared_narration_count,
+                            )
+                        )
+
+                        if st.button(
+                            tr(
+                                "Generate Visual Prompts from Active Shot Plan"
+                            ),
+                            key="generate_visual_prompts_from_active_shot_plan",
+                            use_container_width=True,
+                            type="primary",
+                            icon=":material/movie_edit:",
+                        ):
+                            try:
+                                with st.spinner(
                                     tr(
-                                        "Generate one unique visual prompt for each of the {count} Active Shot Plan windows. "
-                                        "{shared} shots continue narration already present in the previous shot. "
-                                        "The generated prompts are applied to Visual Prompts automatically."
-                                    ).format(
-                                        count=len(visual_payload),
-                                        shared=shared_narration_count,
+                                        "Generating Visual Prompts from Active Shot Plan"
                                     )
-                                )
-
-                                if st.button(
-                                    tr(
-                                        "Generate Visual Prompts from Active Shot Plan"
-                                    ),
-                                    key="generate_visual_prompts_from_active_shot_plan",
-                                    use_container_width=True,
-                                    type="primary",
-                                    icon=":material/movie_edit:",
                                 ):
-                                    try:
-                                        with st.spinner(
-                                            tr(
-                                                "Generating Visual Prompts from Active Shot Plan"
-                                            )
-                                        ):
-                                            visual_plan_result = _run_llm_read_operation(
-                                                "generate_visual_shot_plan",
-                                                lambda app_config_snapshot: (
-                                                    visual_shot_planner.generate_visual_shot_plan(
-                                                        active_shot_plan,
-                                                        video_subject=params.video_subject,
-                                                        response_generator=lambda prompt: llm._generate_response(
-                                                            prompt=prompt,
-                                                            app_config=app_config_snapshot,
-                                                            json_mode=True,
-                                                        ),
-                                                    )
+                                    visual_plan_result = _run_llm_read_operation(
+                                        "generate_visual_shot_plan",
+                                        lambda app_config_snapshot: (
+                                            visual_shot_planner.generate_visual_shot_plan(
+                                                active_shot_plan,
+                                                video_subject=params.video_subject,
+                                                response_generator=lambda prompt: llm._generate_response(
+                                                    prompt=prompt,
+                                                    app_config=app_config_snapshot,
+                                                    json_mode=True,
                                                 ),
                                             )
-                                    except Exception:
-                                        logger.exception(
-                                            "AI visual shot planning failed"
-                                        )
-                                        st.warning(
-                                            tr("Visual Shot Planning Failed")
-                                        )
-                                    else:
-                                        visual_plan_data = (
-                                            visual_plan_result.to_dict()
-                                        )
-                                        visual_prompt_lines = [
-                                            str(prompt or "").strip()
-                                            for prompt in visual_plan_data.get(
-                                                "visual_prompts", []
-                                            )
-                                            if str(prompt or "").strip()
-                                        ]
-                                        if len(visual_prompt_lines) != len(
-                                            visual_payload
-                                        ):
-                                            st.error(
-                                                tr(
-                                                    "Visual Shot Planning Failed"
-                                                ).format(
-                                                    error=(
-                                                        "the generated visual prompt count "
-                                                        "does not match Active Shot Plan"
-                                                    )
-                                                )
-                                            )
-                                        else:
-                                            st.session_state[
-                                                "visual_shot_plan_preview"
-                                            ] = {
-                                                "fingerprint": visual_plan_fingerprint,
-                                                "result": visual_plan_data,
-                                            }
-                                            st.session_state[
-                                                "_pending_visual_shot_prompts"
-                                            ] = "\n".join(visual_prompt_lines)
-                                            st.session_state[
-                                                "applied_visual_shot_plan_fingerprint"
-                                            ] = visual_plan_fingerprint
-                                            st.session_state[
-                                                "applied_visual_shot_plan_voice_fingerprint"
-                                            ] = str(
-                                                cached_preview.get(
-                                                    "fingerprint", ""
-                                                )
-                                                if isinstance(
-                                                    cached_preview, dict
-                                                )
-                                                else ""
-                                            )
-                                            # A new visual plan must rebuild any per-shot hybrid
-                                            # provider proposal from those exact new prompts.
-                                            st.session_state.pop(
-                                                "media_plan_preview", None
-                                            )
-                                            st.rerun()
-
-                                cached_visual_plan = st.session_state.get(
-                                    "visual_shot_plan_preview"
+                                        ),
+                                    )
+                            except Exception:
+                                logger.exception(
+                                    "AI visual shot planning failed"
                                 )
-                                if (
-                                    isinstance(cached_visual_plan, dict)
-                                    and cached_visual_plan.get("fingerprint")
-                                    == visual_plan_fingerprint
-                                    and isinstance(
-                                        cached_visual_plan.get("result"), dict
+                                st.warning(
+                                    tr("Visual Shot Planning Failed")
+                                )
+                            else:
+                                visual_plan_data = (
+                                    visual_plan_result.to_dict()
+                                )
+                                visual_prompt_lines = [
+                                    str(prompt or "").strip()
+                                    for prompt in visual_plan_data.get(
+                                        "visual_prompts", []
                                     )
+                                    if str(prompt or "").strip()
+                                ]
+                                if len(visual_prompt_lines) != len(
+                                    visual_payload
                                 ):
-                                    visual_plan_data = cached_visual_plan["result"]
-                                    visual_shots = list(
-                                        visual_plan_data.get("shots", []) or []
-                                    )
-                                    visual_prompt_lines = [
-                                        str(prompt or "").strip()
-                                        for prompt in visual_plan_data.get(
-                                            "visual_prompts", []
-                                        )
-                                        if str(prompt or "").strip()
-                                    ]
-                                    current_prompt_lines = (
-                                        _video_term_lines_for_timeline(
-                                            getattr(params, "video_terms", None)
-                                        )
-                                    )
-                                    visual_plan_applied = (
-                                        bool(visual_prompt_lines)
-                                        and current_prompt_lines
-                                        == visual_prompt_lines
-                                        and str(
-                                            st.session_state.get(
-                                                "applied_visual_shot_plan_fingerprint",
-                                                "",
+                                    st.error(
+                                        tr(
+                                            "Visual Shot Planning Failed"
+                                        ).format(
+                                            error=(
+                                                "the generated visual prompt count "
+                                                "does not match Active Shot Plan"
                                             )
-                                            or ""
                                         )
-                                        == visual_plan_fingerprint
                                     )
+                                else:
+                                    st.session_state[
+                                        "visual_shot_plan_preview"
+                                    ] = {
+                                        "fingerprint": visual_plan_fingerprint,
+                                        "result": visual_plan_data,
+                                    }
+                                    st.session_state[
+                                        "_pending_visual_shot_prompts"
+                                    ] = "\n".join(visual_prompt_lines)
+                                    st.session_state[
+                                        "applied_visual_shot_plan_fingerprint"
+                                    ] = visual_plan_fingerprint
+                                    st.session_state[
+                                        "applied_visual_shot_plan_voice_fingerprint"
+                                    ] = str(
+                                        cached_preview.get(
+                                            "fingerprint", ""
+                                        )
+                                        if isinstance(
+                                            cached_preview, dict
+                                        )
+                                        else ""
+                                    )
+                                    # A new visual plan must rebuild any per-shot hybrid
+                                    # provider proposal from those exact new prompts.
+                                    st.session_state.pop(
+                                        "media_plan_preview", None
+                                    )
+                                    st.rerun()
 
-                                    if visual_plan_applied:
-                                        st.success(
-                                            tr(
-                                                "{count} Visual Prompts from Active Shot Plan are applied."
-                                            ).format(
-                                                count=len(visual_prompt_lines)
-                                            )
-                                        )
-                                    else:
-                                        st.warning(
-                                            tr(
-                                                "The generated Visual Prompts are no longer applied. Regenerate them from Active Shot Plan before timeline-aware generation."
-                                            )
-                                        )
+                        cached_visual_plan = st.session_state.get(
+                            "visual_shot_plan_preview"
+                        )
+                        if (
+                            isinstance(cached_visual_plan, dict)
+                            and cached_visual_plan.get("fingerprint")
+                            == visual_plan_fingerprint
+                            and isinstance(
+                                cached_visual_plan.get("result"), dict
+                            )
+                        ):
+                            visual_plan_data = cached_visual_plan["result"]
+                            visual_shots = list(
+                                visual_plan_data.get("shots", []) or []
+                            )
+                            visual_prompt_lines = [
+                                str(prompt or "").strip()
+                                for prompt in visual_plan_data.get(
+                                    "visual_prompts", []
+                                )
+                                if str(prompt or "").strip()
+                            ]
+                            current_prompt_lines = (
+                                _video_term_lines_for_timeline(
+                                    getattr(params, "video_terms", None)
+                                )
+                            )
+                            visual_plan_applied = (
+                                bool(visual_prompt_lines)
+                                and current_prompt_lines
+                                == visual_prompt_lines
+                                and str(
+                                    st.session_state.get(
+                                        "applied_visual_shot_plan_fingerprint",
+                                        "",
+                                    )
+                                    or ""
+                                )
+                                == visual_plan_fingerprint
+                            )
 
-                                    # Per-shot provider planning is a hybrid-only concern. Single
-                                    # Source stops here and uses the selected Video Source for every
-                                    # locked shot.
-                                    if (
-                                        str(
-                                            getattr(
-                                                params,
-                                                "media_source_mode",
-                                                MEDIA_SOURCE_MODE_SINGLE,
-                                            )
-                                            or ""
-                                        )
-                                        == MEDIA_SOURCE_MODE_HYBRID
-                                        and visual_plan_applied
-                                        and visual_shots
-                                    ):
-                                        _render_media_planner(
-                                            visual_shots,
-                                            visual_plan_fingerprint,
-                                            params,
-                                        )
+                            if visual_plan_applied:
+                                st.success(
+                                    tr(
+                                        "{count} Visual Prompts from Active Shot Plan are applied."
+                                    ).format(
+                                        count=len(visual_prompt_lines)
+                                    )
+                                )
+                            else:
+                                st.warning(
+                                    tr(
+                                        "The generated Visual Prompts are no longer applied. Regenerate them from Active Shot Plan before timeline-aware generation."
+                                    )
+                                )
+
+                            # Per-shot provider planning is a hybrid-only concern. Single
+                            # Source stops here and uses the selected Video Source for every
+                            # locked shot.
+                            if (
+                                str(
+                                    getattr(
+                                        params,
+                                        "media_source_mode",
+                                        MEDIA_SOURCE_MODE_SINGLE,
+                                    )
+                                    or ""
+                                )
+                                == MEDIA_SOURCE_MODE_HYBRID
+                                and visual_plan_applied
+                                and visual_shots
+                            ):
+                                _render_media_planner(
+                                    visual_shots,
+                                    visual_plan_fingerprint,
+                                    params,
+                                )
 
 
 def _video_term_lines_for_timeline(value) -> list[str]:
@@ -7672,7 +7678,7 @@ def _has_explicit_current_media_plan(params) -> bool:
 
 
 def _matching_applied_media_shot_timeline(
-    params, reusable_voice_preview: dict | None
+    params, narration_preview: dict | None
 ) -> list[dict] | None:
     raw_media_plan = getattr(params, "media_plan", None) or None
     if not raw_media_plan and not timeline_media.is_timeline_aware_generated_source(
@@ -7707,7 +7713,7 @@ def _matching_applied_media_shot_timeline(
             "the applied Visual Shot Plan no longer contains one timing window per prompt"
         )
 
-    if not reusable_voice_preview:
+    if not narration_preview:
         raise timeline_media.TimelineMediaError(
             "the applied Visual Shot Plan requires the matching Full Audio preview; "
             "generate Full Audio again before starting timeline-aware generation"
@@ -7716,10 +7722,9 @@ def _matching_applied_media_shot_timeline(
     applied_voice_fingerprint = str(
         st.session_state.get("applied_visual_shot_plan_voice_fingerprint", "") or ""
     )
-    current_voice_preview = st.session_state.get("voice_preview_audio")
     current_voice_fingerprint = str(
-        current_voice_preview.get("fingerprint", "")
-        if isinstance(current_voice_preview, dict)
+        narration_preview.get("fingerprint", "")
+        if isinstance(narration_preview, dict)
         else ""
     )
     if (
@@ -7731,7 +7736,7 @@ def _matching_applied_media_shot_timeline(
             "regenerate the Visual Shot Plan after the current Full Audio"
         )
 
-    duration = reusable_voice_preview.get("duration")
+    duration = narration_preview.get("duration")
     normalized_timeline = timeline_media.normalize_locked_shot_timeline(
         raw_shots,
         audio_duration=float(duration),
@@ -7804,6 +7809,7 @@ def _get_reusable_full_voice_preview(params, voice_mode: str) -> dict | None:
     return {
         "audio_bytes": bytes(cached_preview["audio_bytes"]),
         "duration": float(duration),
+        "fingerprint": expected_fingerprint,
         "sub_maker": cached_preview["sub_maker"],
         "narration_timeline": cached_preview.get("narration_timeline"),
         "script": script_content,
@@ -8333,6 +8339,216 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
         st.warning(tr("ElevenLabs API Key Required"))
     st.session_state["last_rendered_bgm_type"] = params.bgm_type
     return uploaded_bgm_file
+
+
+def _uploaded_narration_fingerprint(script: str, uploaded_audio_file) -> str:
+    """Bind uploaded narration analysis to both the exact script and audio bytes."""
+    digest = hashlib.sha256()
+    digest.update(b"enigmaprinter-uploaded-narration-v1\0")
+    digest.update(str(script or "").strip().encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(uploaded_audio_file.getbuffer())
+    return digest.hexdigest()
+
+
+def _invalidate_uploaded_narration_downstream_state():
+    """Drop plans that were derived from a previous script/audio pair."""
+    for key in (
+        "media_shot_refinement_preview",
+        "visual_shot_plan_preview",
+        "media_plan_preview",
+        "applied_visual_shot_plan_fingerprint",
+        "applied_visual_shot_plan_voice_fingerprint",
+    ):
+        st.session_state.pop(key, None)
+
+
+def _analyze_uploaded_narration(params, uploaded_audio_file) -> dict:
+    script_content = str(params.video_script or "").strip()
+    if not script_content:
+        raise narration_alignment.NarrationAlignmentError(
+            "script must contain narration text"
+        )
+
+    audio_bytes = bytes(uploaded_audio_file.getbuffer())
+    fingerprint = _uploaded_narration_fingerprint(
+        script_content,
+        uploaded_audio_file,
+    )
+    temp_dir = utils.storage_dir("temp", create=True)
+    temp_audio_path = _build_uploaded_file_path(
+        uploaded_audio_file,
+        temp_dir,
+        CUSTOM_AUDIO_EXTENSIONS,
+        "uploaded-narration-analysis",
+    )
+    try:
+        with open(temp_audio_path, "wb") as file:
+            file.write(audio_bytes)
+        alignment = narration_alignment.align_external_narration(
+            audio_file=temp_audio_path,
+            script=script_content,
+        )
+    finally:
+        try:
+            os.remove(temp_audio_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(
+                "failed to delete uploaded narration analysis file: "
+                f"path={temp_audio_path}, error={exc}"
+            )
+
+    timeline = alignment.timeline.to_dict()
+    duration = float(timeline.get("audio_duration", 0.0) or 0.0)
+    mime_type = str(getattr(uploaded_audio_file, "type", "") or "").strip()
+    if not mime_type.startswith("audio/"):
+        mime_type = (
+            mimetypes.guess_type(str(uploaded_audio_file.name or ""))[0]
+            or "audio/mpeg"
+        )
+
+    return {
+        "preview_type": "uploaded",
+        "fingerprint": fingerprint,
+        "duration": duration,
+        "mime_type": mime_type,
+        "narration_timeline": timeline,
+        "content_digest": hashlib.sha256(
+            script_content.encode("utf-8")
+        ).hexdigest(),
+        "alignment_summary": {
+            "matched": alignment.matched_word_count,
+            "script": alignment.script_word_count,
+            "recognized": alignment.recognized_word_count,
+            "script_coverage": alignment.script_coverage,
+            "recognized_coverage": alignment.recognized_coverage,
+        },
+    }
+
+
+def _get_matching_uploaded_narration_preview(
+    params,
+    uploaded_audio_file,
+) -> dict | None:
+    if uploaded_audio_file is None:
+        return None
+    script_content = str(params.video_script or "").strip()
+    if not script_content:
+        return None
+    try:
+        expected_fingerprint = _uploaded_narration_fingerprint(
+            script_content,
+            uploaded_audio_file,
+        )
+    except Exception:
+        return None
+
+    cached_preview = st.session_state.get("voice_preview_audio")
+    if (
+        not isinstance(cached_preview, dict)
+        or cached_preview.get("preview_type") != "uploaded"
+        or cached_preview.get("fingerprint") != expected_fingerprint
+        or not isinstance(cached_preview.get("narration_timeline"), dict)
+        or not cached_preview["narration_timeline"].get("segments")
+    ):
+        return None
+
+    duration = cached_preview.get("duration")
+    if (
+        not isinstance(duration, (int, float))
+        or not math.isfinite(duration)
+        or duration <= 0
+    ):
+        return None
+    return cached_preview
+
+
+def _render_uploaded_narration_analysis(params, uploaded_audio_file):
+    """Analyze uploaded voiceover against the current script, then reuse audio-first UI."""
+    if uploaded_audio_file is None:
+        return
+
+    script_content = str(params.video_script or "").strip()
+    if not script_content:
+        st.caption(tr("Voiceover Script Required"))
+        return
+
+    current_fingerprint = _uploaded_narration_fingerprint(
+        script_content,
+        uploaded_audio_file,
+    )
+    cached_preview = st.session_state.get("voice_preview_audio")
+    if (
+        isinstance(cached_preview, dict)
+        and cached_preview.get("preview_type") == "uploaded"
+        and cached_preview.get("fingerprint") != current_fingerprint
+    ):
+        st.session_state.pop("voice_preview_audio", None)
+        _invalidate_uploaded_narration_downstream_state()
+        cached_preview = None
+
+    analyze_requested = st.button(
+        tr("Analyze Uploaded Narration"),
+        key="analyze_uploaded_narration_button",
+        icon=":material/graphic_eq:",
+        use_container_width=True,
+        help=tr("Analyze Uploaded Narration Help"),
+    )
+    if analyze_requested and (
+        not isinstance(cached_preview, dict)
+        or cached_preview.get("fingerprint") != current_fingerprint
+    ):
+        try:
+            with st.spinner(tr("Analyzing Uploaded Narration")):
+                preview_result = _analyze_uploaded_narration(
+                    params,
+                    uploaded_audio_file,
+                )
+        except narration_alignment.NarrationAlignmentError as exc:
+            logger.warning(f"uploaded narration alignment rejected: {exc}")
+            if (
+                isinstance(cached_preview, dict)
+                and cached_preview.get("preview_type") == "uploaded"
+            ):
+                st.session_state.pop("voice_preview_audio", None)
+            _invalidate_uploaded_narration_downstream_state()
+            st.error(
+                tr("Uploaded Narration Alignment Failed").format(error=str(exc))
+            )
+            return
+        except Exception as exc:
+            logger.exception("uploaded narration analysis failed")
+            _invalidate_uploaded_narration_downstream_state()
+            st.error(
+                tr("Uploaded Narration Alignment Failed").format(error=str(exc))
+            )
+            return
+        else:
+            _invalidate_uploaded_narration_downstream_state()
+            st.session_state["voice_preview_audio"] = preview_result
+            cached_preview = preview_result
+
+    cached_preview = _get_matching_uploaded_narration_preview(
+        params,
+        uploaded_audio_file,
+    )
+    if not cached_preview:
+        return
+
+    summary = cached_preview.get("alignment_summary", {}) or {}
+    st.success(
+        tr("Uploaded Narration Alignment Summary").format(
+            matched=int(summary.get("matched", 0) or 0),
+            script=int(summary.get("script", 0) or 0),
+            coverage=float(summary.get("script_coverage", 0.0) or 0.0),
+            recognized_coverage=float(
+                summary.get("recognized_coverage", 0.0) or 0.0
+            ),
+        )
+    )
+    _render_audio_first_timeline_plan(params, cached_preview)
 
 
 def _render_audio_settings(panel, params):
@@ -8980,6 +9196,10 @@ def _render_audio_settings(panel, params):
                         tr(
                             "Custom audio will be used directly. TTS synthesis will be skipped for this task."
                         )
+                    )
+                    _render_uploaded_narration_analysis(
+                        params,
+                        uploaded_audio_file,
                     )
             uploaded_bgm_file = _render_background_music_settings(
                 params,
@@ -9666,6 +9886,12 @@ def _render_generation_controls(
             params,
             voice_mode,
         )
+        timeline_voice_preview = reusable_voice_preview
+        if voice_mode == VOICE_MODE_UPLOAD:
+            timeline_voice_preview = _get_matching_uploaded_narration_preview(
+                params,
+                uploaded_audio_file,
+            )
 
         # The Media Plan is advisory until the user explicitly enables hybrid
         # dispatch. Keeping it out of VideoParams here preserves both the legacy
@@ -9676,7 +9902,7 @@ def _render_generation_controls(
         try:
             params.media_shot_timeline = _matching_applied_media_shot_timeline(
                 params,
-                reusable_voice_preview,
+                timeline_voice_preview,
             )
         except timeline_media.TimelineMediaError as exc:
             _remove_active_generation_task(task_id)
