@@ -1,0 +1,41 @@
+name: Apply uploaded narration WebUI refactor
+
+on:
+  push:
+    branches:
+      - feature/uploaded-audio-alignment
+
+permissions:
+  contents: write
+
+jobs:
+  apply-webui-refactor:
+    if: ${{ !contains(github.event.head_commit.message, '[webui-patch]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: feature/uploaded-audio-alignment
+
+      - name: Apply deterministic WebUI patch
+        run: python scripts/apply_uploaded_audio_alignment_webui.py
+
+      - name: Compile patched sources
+        run: |
+          python -m py_compile webui/Main.py
+          python -m py_compile app/services/narration_alignment.py
+          python -m py_compile app/services/uploaded_narration_plan.py
+
+      - name: Commit patched WebUI
+        run: |
+          if git diff --quiet -- webui/Main.py webui/i18n/en.json webui/i18n/es.json; then
+            echo "WebUI patch already applied."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add webui/Main.py webui/i18n/en.json webui/i18n/es.json
+          git commit -m "feat: wire uploaded narration into audio-first WebUI [webui-patch]"
+          git push origin HEAD:feature/uploaded-audio-alignment
