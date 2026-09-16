@@ -110,18 +110,18 @@ class TestNarrationAlignment(unittest.TestCase):
     def test_every_script_segment_needs_real_timing_evidence(self):
         words = [
             narration_alignment.RecognizedWord("Primera", 0.0, 0.4),
-            narration_alignment.RecognizedWord("frase", 0.4, 0.8),
+            narration_alignment.RecognizedWord("escena", 0.4, 0.8),
             narration_alignment.RecognizedWord("Tercera", 1.6, 2.0),
-            narration_alignment.RecognizedWord("frase", 2.0, 2.4),
+            narration_alignment.RecognizedWord("secuencia", 2.0, 2.4),
         ]
 
         with self.assertRaisesRegex(
             narration_alignment.NarrationAlignmentError,
-            r"script segment 2 could not be aligned reliably .*segment coverage 50%, required 60%",
+            r"script segment 2 could not be aligned reliably .*segment coverage 0%, required 60%",
         ):
             narration_alignment.align_external_narration(
                 audio_file="unused.wav",
-                script="Primera frase. Segunda frase. Tercera frase.",
+                script="Primera escena. Segunda toma. Tercera secuencia.",
                 audio_duration=3.0,
                 recognized_words=words,
                 minimum_script_coverage=0.60,
