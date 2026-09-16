@@ -147,6 +147,7 @@ class VideoParams(BaseModel):
     voice_name: Optional[str] = ""
     voice_volume: Optional[float] = 1.0
     voice_rate: Optional[float] = 1.0
+    voice_pitch: Optional[float] = 0.0
     bgm_type: Optional[str] = "random"
     bgm_file: Optional[str] = ""
     bgm_volume: Optional[float] = 0.2
@@ -186,6 +187,7 @@ class SubtitleRequest(BaseModel):
     voice_name: Optional[str] = "zh-CN-XiaoxiaoNeural-Female"
     voice_volume: Optional[float] = 1.0
     voice_rate: Optional[float] = 1.2
+    voice_pitch: Optional[float] = 0.0
     bgm_type: Optional[str] = "random"
     bgm_file: Optional[str] = ""
     bgm_volume: Optional[float] = 0.2
@@ -213,6 +215,7 @@ class AudioRequest(BaseModel):
     voice_name: Optional[str] = "zh-CN-XiaoxiaoNeural-Female"
     voice_volume: Optional[float] = 1.0
     voice_rate: Optional[float] = 1.2
+    voice_pitch: Optional[float] = 0.0
     bgm_type: Optional[str] = "random"
     bgm_file: Optional[str] = ""
     bgm_volume: Optional[float] = 0.2

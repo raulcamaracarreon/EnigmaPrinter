@@ -70,6 +70,123 @@ class VisualShotPlannerTests(unittest.TestCase):
         self.assertEqual(data["shots"][1]["narration_indices"], [3])
         self.assertEqual(len(data["visual_prompts"]), 3)
 
+    def test_retries_after_malformed_json_response(self):
+        calls = 0
+        valid_response = json.dumps(
+            {
+                "shots": [
+                    {
+                        "shot_index": 1,
+                        "visual_prompt": "Wide view of the dim office corridor at night.",
+                    },
+                    {
+                        "shot_index": 2,
+                        "visual_prompt": "The woman approaches the vintage elevator doors.",
+                    },
+                    {
+                        "shot_index": 3,
+                        "visual_prompt": "Nearly empty lobby beneath weak yellow lamps.",
+                    },
+                ]
+            }
+        )
+
+        def responder(prompt):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return '{"shots":[{"shot_index":1,"visual_prompt":"broken"}'
+            return valid_response
+
+        plan = visual_shot_planner.generate_visual_shot_plan(
+            self._base_plan(),
+            response_generator=responder,
+        )
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(len(plan.shots), 3)
+
+    def test_batches_more_than_eight_shots_and_restores_global_indices(self):
+        base_plan = {
+            "shots": [
+                {
+                    "index": index,
+                    "scene_index": index,
+                    "scene_indices": [index],
+                    "start": float((index - 1) * 4),
+                    "end": float(index * 4),
+                    "narration_indices": [index],
+                    "narration_text": f"Narration for scene {index}.",
+                    "end_boundary_source": "scene_boundary",
+                }
+                for index in range(1, 11)
+            ]
+        }
+
+        calls = []
+
+        def responder(prompt):
+            calls.append(prompt)
+
+            if len(calls) == 1:
+                count = 8
+                batch_name = "first"
+            else:
+                count = 2
+                batch_name = "second"
+
+            return json.dumps(
+                {
+                    "shots": [
+                        {
+                            "shot_index": local_index,
+                            "visual_prompt": (
+                                f"{batch_name} batch visual "
+                                f"{local_index}."
+                            ),
+                        }
+                        for local_index in range(1, count + 1)
+                    ]
+                }
+            )
+
+        plan = visual_shot_planner.generate_visual_shot_plan(
+            base_plan,
+            response_generator=responder,
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(plan.shots), 10)
+
+        self.assertEqual(
+            plan.shots[0].visual_prompt,
+            "first batch visual 1.",
+        )
+        self.assertEqual(
+            plan.shots[7].visual_prompt,
+            "first batch visual 8.",
+        )
+        self.assertEqual(
+            plan.shots[8].visual_prompt,
+            "second batch visual 1.",
+        )
+        self.assertEqual(
+            plan.shots[9].visual_prompt,
+            "second batch visual 2.",
+        )
+
+        self.assertEqual(plan.shots[8].index, 9)
+        self.assertEqual(plan.shots[9].index, 10)
+
+        self.assertIn(
+            "Narration for scene 9.",
+            calls[1],
+        )
+        self.assertNotIn(
+            "Narration for scene 1.",
+            calls[1],
+        )
+
     def test_rejects_missing_shot(self):
         response = json.dumps(
             {"shots": [{"shot_index": 1, "visual_prompt": "One useful prompt."}]}

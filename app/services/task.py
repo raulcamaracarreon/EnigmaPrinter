@@ -327,18 +327,76 @@ def generate_terms(task_id, params, video_script):
         and scene_prompts
         and not hybrid_media_plan
     ):
-        try:
-            video_terms = material.expand_comfyui_video_scene_prompts(
-                scene_prompts=scene_prompts,
-                subject_anchors=getattr(
-                    params, "comfyui_video_subject_anchors", ""
-                ),
+        raw_subject_anchors = str(
+            getattr(
+                params,
+                "comfyui_video_subject_anchors",
+                "",
             )
+            or ""
+        )
+
+        try:
+            video_terms = (
+                material.expand_comfyui_video_scene_prompts(
+                    scene_prompts=scene_prompts,
+                    subject_anchors=raw_subject_anchors,
+                )
+            )
+
+            parsed_anchors = (
+                material.parse_comfyui_video_subject_anchors(
+                    raw_subject_anchors
+                )
+            )
+
         except ValueError as exc:
-            _mark_task_failed(task_id, "terms", str(exc))
+            _mark_task_failed(
+                task_id,
+                "terms",
+                str(exc),
+            )
             return None
+
+        source_scene_prompts = [
+            line.strip()
+            for line in scene_prompts.splitlines()
+            if line.strip()
+        ]
+
+        # Only invoke the LLM cleanup when literal anchor expansion
+        # actually changed the prompts. Plain/manual prompts that do
+        # not use Subject Anchors must pass through untouched.
+        if (
+            parsed_anchors
+            and video_terms != source_scene_prompts
+        ):
+            refinement_anchors = [
+                {
+                    "tag": tag[1:-1],
+                    "description": description,
+                }
+                for tag, description
+                in parsed_anchors.items()
+            ]
+
+            video_terms = (
+                llm.refine_expanded_scene_prompts(
+                    video_terms,
+                    source_scene_prompts=(
+                        source_scene_prompts
+                    ),
+                    anchors=refinement_anchors,
+                    video_subject=getattr(
+                        params,
+                        "video_subject",
+                        "",
+                    ),
+                )
+            )
+
         logger.debug(
-            "ComfyUI Video expanded scene prompts: "
+            "ComfyUI Video final scene prompts: "
             f"{utils.to_json(video_terms)}"
         )
     else:
@@ -499,9 +557,13 @@ def _resolve_reusable_voice_preview(
         "voice_name": params.voice_name,
         "voice_rate": float(params.voice_rate),
         "voice_volume": float(params.voice_volume),
+        "voice_pitch": float(getattr(params, "voice_pitch", 0.0) or 0.0),
     }
+    cached_values = dict(voice_preview)
+    cached_values.setdefault("voice_pitch", 0.0)
+
     if not math.isclose(float(params.voice_volume), 1.0) or any(
-        voice_preview.get(key) != value for key, value in expected_values.items()
+        cached_values.get(key) != value for key, value in expected_values.items()
     ):
         logger.info(
             f"skip stale voice preview cache, task_id: {task_id}, "
@@ -591,6 +653,7 @@ def generate_audio(
             voice_name=voice.parse_voice_name(params.voice_name),
             voice_rate=params.voice_rate,
             voice_file=audio_file,
+            voice_pitch=params.voice_pitch,
         )
         if sub_maker is None:
             _mark_task_failed(

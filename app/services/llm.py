@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import requests
 from time import perf_counter
 from typing import List
 
@@ -254,7 +255,32 @@ def _extract_qwen_generation_text(response) -> str:
     return _normalize_text_response(text, "qwen")
 
 
-def _generate_response(prompt: str, app_config=None) -> str:
+def _ollama_native_base_url(base_url: str) -> str:
+    """Convert an Ollama OpenAI-compatible base URL into the native API root."""
+    value = str(base_url or "").strip().rstrip("/")
+    if value.endswith("/v1"):
+        value = value[:-3]
+    return value.rstrip("/")
+
+
+def _ollama_think_value(model_name: str):
+    """
+    Select the native Ollama thinking mode.
+
+    GPT-OSS cannot fully disable thinking, so use its lowest supported level.
+    Qwen and other local utility models use thinking disabled.
+    """
+    normalized = str(model_name or "").strip().lower()
+    if normalized.startswith("gpt-oss"):
+        return "low"
+    return False
+
+
+def _generate_response(
+    prompt: str,
+    app_config=None,
+    json_mode: bool = False,
+) -> str:
     try:
         # WebUI 在视频生成期间允许用户准备下一条文案。调用方可以传入提交瞬间
         # 的配置快照，确保模型请求重试期间不会因为后台任务结束并应用新配置，
@@ -609,6 +635,42 @@ def _generate_response(prompt: str, app_config=None) -> str:
             else:
                 raise Exception(f"[{llm_provider}] returned an empty response")
 
+        if llm_provider == "ollama":
+            native_base_url = _ollama_native_base_url(base_url)
+            native_url = f"{native_base_url}/api/chat"
+
+            payload = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "think": _ollama_think_value(model_name),
+            }
+
+            if json_mode:
+                payload["format"] = "json"
+                payload["options"] = {"temperature": 0}
+
+            logger.info(
+                "requesting Ollama native chat: "
+                f"model={model_name}, json_mode={json_mode}, "
+                f"think={payload['think']}"
+            )
+
+            response = requests.post(
+                native_url,
+                json=payload,
+                timeout=300,
+            )
+            response.raise_for_status()
+
+            data = response.json()
+            message = data.get("message")
+            if not isinstance(message, dict):
+                raise ValueError("[ollama] returned empty message")
+
+            content = message.get("content")
+            return _normalize_text_response(content, llm_provider)
+
         client = OpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -618,11 +680,6 @@ def _generate_response(prompt: str, app_config=None) -> str:
             "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
         }
-
-        if llm_provider == "ollama":
-            request_kwargs["extra_body"] = {
-                "reasoning_effort": "none"
-            }
 
         response = client.chat.completions.create(**request_kwargs)
         if response:
@@ -976,6 +1033,7 @@ def _normalize_visual_anchor_plan(data: dict, expected_scene_count: int) -> dict
 
         if not prompt:
             raise ValueError(f"scene prompt {position} is empty")
+
         received_indices.append(index)
         references = set(_VISUAL_ANCHOR_REFERENCE_RE.findall(prompt))
         undefined = sorted(references - defined_tags)
@@ -1018,6 +1076,506 @@ def _normalize_visual_anchor_plan(data: dict, expected_scene_count: int) -> dict
     }
 
 
+
+def _expand_visual_anchor_scene_prompts(
+    scene_prompts,
+    anchors,
+) -> List[str]:
+    """
+    Expand validated [TAG] references using the fixed Subject Anchor library.
+
+    Expansion is intentionally literal. Any grammar artifacts produced by
+    inserting a long noun phrase are handled by the refinement stage below.
+    """
+    anchor_map = {
+        str(anchor["tag"]): str(anchor["description"]).rstrip(
+            " \t\r\n.,;:!?"
+        )
+        for anchor in anchors
+    }
+
+    expanded_prompts = []
+
+    for prompt in scene_prompts:
+        expanded = _VISUAL_ANCHOR_REFERENCE_RE.sub(
+            lambda match: anchor_map.get(
+                match.group(1),
+                match.group(0),
+            ),
+            str(prompt),
+        ).strip()
+
+        expanded_prompts.append(expanded)
+
+    return expanded_prompts
+
+
+
+def _find_expanded_prompt_artifacts(
+    prompt: str,
+    anchors=None,
+) -> List[str]:
+    """
+    Detect objective grammar artifacts introduced by literal anchor expansion.
+
+    This validator does not judge story quality or creative choices.
+    """
+    text = str(prompt or "").strip()
+    issues = []
+
+    for anchor in anchors or []:
+        if not isinstance(anchor, dict):
+            continue
+
+        description = str(
+            anchor.get("description") or ""
+        ).strip().rstrip(
+            " \t\r\n.,;:!?"
+        )
+
+        if not description:
+            continue
+
+        lowered = text.lower()
+
+        for suffix in ("'s", "\u2019s"):
+            bad_phrase = (
+                description + suffix
+            )
+
+            if bad_phrase.lower() in lowered:
+                issues.append(
+                    "full expanded anchor used as "
+                    f"possessive: {bad_phrase}"
+                )
+
+    malformed_determiner = re.search(
+        r"\b(?:the|a|an)\s+"
+        r"(?:(?:open|opened|closed)\s+)?"
+        r"(?:a|an)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if malformed_determiner:
+        issues.append(
+            "malformed duplicated determiner: "
+            + malformed_determiner.group(0)
+        )
+
+    return issues
+
+
+def refine_expanded_scene_prompts(
+    expanded_prompts,
+    *,
+    source_scene_prompts=None,
+    anchors=None,
+    video_subject: str = "",
+    app_config=None,
+) -> List[str]:
+    """
+    Clean linguistic artifacts introduced by Subject Anchor expansion.
+
+    The model is only a copy editor here. It must preserve the visual and
+    narrative content. If cleanup cannot be validated, the original expanded
+    prompt remains usable and the workflow continues.
+    """
+    prompts = _normalize_visual_prompt_lines(
+        expanded_prompts
+    )
+
+    source_prompts = (
+        _normalize_visual_prompt_lines(
+            source_scene_prompts
+        )
+        if source_scene_prompts
+        else list(prompts)
+    )
+
+    if len(source_prompts) != len(prompts):
+        raise ValueError(
+            "source_scene_prompts must match "
+            "expanded_prompts count"
+        )
+
+    batch_size = 8
+    refined_prompts = []
+
+    def call_json(prompt_text: str) -> str:
+        if app_config is None:
+            return _generate_response(
+                prompt_text,
+                json_mode=True,
+            )
+
+        return _generate_response(
+            prompt_text,
+            app_config=app_config,
+            json_mode=True,
+        )
+
+    batch_count = math.ceil(
+        len(prompts) / batch_size
+    )
+
+    for batch_number, batch_start in enumerate(
+        range(0, len(prompts), batch_size),
+        start=1,
+    ):
+        batch_end = min(
+            batch_start + batch_size,
+            len(prompts),
+        )
+
+        source_batch = source_prompts[
+            batch_start:batch_end
+        ]
+        expanded_batch = prompts[
+            batch_start:batch_end
+        ]
+
+        indexed_batch = [
+            {
+                "index": batch_start + offset + 1,
+                "source_scene_prompt": source_prompt,
+                "expanded_prompt": expanded_prompt,
+            }
+            for offset, (
+                source_prompt,
+                expanded_prompt,
+            ) in enumerate(
+                zip(
+                    source_batch,
+                    expanded_batch,
+                )
+            )
+        ]
+
+        expected_indices = [
+            item["index"]
+            for item in indexed_batch
+        ]
+
+        generation_prompt = f"""
+# Role: Expanded Visual Prompt Copy Editor
+
+## Goal
+Rewrite the expanded prompts into natural, fluent English while preserving
+their exact visual meaning.
+
+These prompts were created by mechanically replacing Subject Anchor [TAG]
+references with full descriptive noun phrases. That mechanical substitution
+can create awkward grammar. Your job is to actively repair those artifacts.
+
+Do NOT reinterpret the story and do NOT make creative changes.
+
+## Typical Expansion Artifacts
+
+BAD:
+a man with short dark hair wearing blue jeans's hand
+
+GOOD:
+the hand of a man with short dark hair wearing blue jeans
+
+BAD:
+a vintage telephone with a brass dial's internal mechanism
+
+GOOD:
+the internal mechanism of a vintage telephone with a brass dial
+
+BAD:
+the open a wooden drawer
+
+GOOD:
+the open wooden drawer
+
+BAD:
+a dimly lit bedroom, a dimly lit bedroom with a wooden table
+
+GOOD:
+merge the accidental immediate repetition into one natural description
+
+BAD:
+a photograph showing a man opening a door lying on the floor
+
+GOOD:
+a photograph lying on the floor, showing a man opening a door
+
+## Output Format
+Return ONLY one valid JSON object with exactly one key:
+
+"scene_prompts": an array of objects with exactly:
+- "index"
+- "prompt"
+
+## Constraints
+1. Return exactly {len(indexed_batch)} prompts.
+2. Preserve these exact indices and order:
+   {", ".join(str(index) for index in expected_indices)}
+3. Preserve every subject, object, action, spatial relation, camera framing,
+   lighting condition, time cue, weather detail, atmosphere, and narrative fact.
+4. Actively fix grammar produced by anchor expansion, especially long
+   possessive noun phrases, malformed articles, modifier attachment,
+   punctuation, agreement, and immediate duplicated wording.
+5. Do not add visual information.
+6. Do not remove visual information.
+7. Do not change characters, objects, locations, chronology, camera,
+   lighting, weather, actions, or story events.
+8. Do not summarize the scenes.
+9. Final prompts must contain no Subject Anchor [TAG] references.
+10. Keep every prompt in English.
+11. Return no markdown, commentary, code fences, or explanations.
+
+## Video Subject
+{video_subject}
+
+## Prompts
+{json.dumps(indexed_batch, ensure_ascii=False)}
+""".strip()
+
+        logger.info(
+            "refining expanded Scene Prompts "
+            f"batch {batch_number}/{batch_count}: "
+            f"scenes "
+            f"{expected_indices[0]}-"
+            f"{expected_indices[-1]}"
+        )
+
+        current_prompt = generation_prompt
+        refined_batch = None
+        last_error = None
+
+        # One normal copy-editing attempt plus one focused repair.
+        for attempt in range(1, 3):
+            parsed_data = None
+
+            try:
+                response = call_json(
+                    current_prompt
+                )
+
+                if response.startswith("Error: "):
+                    raise ValueError(
+                        response.removeprefix(
+                            "Error: "
+                        ).strip()
+                        or "unknown LLM error"
+                    )
+
+                parsed_data = (
+                    _load_json_object_response(
+                        response
+                    )
+                )
+
+                raw_scenes = parsed_data.get(
+                    "scene_prompts"
+                )
+
+                if not isinstance(
+                    raw_scenes,
+                    list,
+                ):
+                    raise ValueError(
+                        "scene_prompts must be "
+                        "a JSON array"
+                    )
+
+                if len(raw_scenes) != len(
+                    indexed_batch
+                ):
+                    raise ValueError(
+                        "refinement changed scene count: "
+                        f"expected={len(indexed_batch)}, "
+                        f"received={len(raw_scenes)}"
+                    )
+
+                candidate_prompts = []
+                received_indices = []
+                artifact_errors = []
+
+                for raw_scene in raw_scenes:
+                    if not isinstance(
+                        raw_scene,
+                        dict,
+                    ):
+                        raise ValueError(
+                            "each refined Scene Prompt "
+                            "must be a JSON object"
+                        )
+
+                    try:
+                        index = int(
+                            raw_scene.get("index")
+                        )
+                    except (
+                        TypeError,
+                        ValueError,
+                        OverflowError,
+                    ) as exc:
+                        raise ValueError(
+                            "each refined Scene Prompt "
+                            "index must be an integer"
+                        ) from exc
+
+                    prompt_text = str(
+                        raw_scene.get("prompt")
+                        or ""
+                    ).strip()
+
+                    if not prompt_text:
+                        raise ValueError(
+                            "refined Scene Prompt "
+                            f"{index} is empty"
+                        )
+
+                    if (
+                        _VISUAL_ANCHOR_REFERENCE_RE.search(
+                            prompt_text
+                        )
+                    ):
+                        raise ValueError(
+                            "refined Scene Prompt must "
+                            "not contain Subject Anchor "
+                            "references"
+                        )
+
+                    issues = (
+                        _find_expanded_prompt_artifacts(
+                            prompt_text,
+                            anchors=anchors,
+                        )
+                    )
+
+                    for issue in issues:
+                        artifact_errors.append(
+                            f"scene {index}: {issue}"
+                        )
+
+                    received_indices.append(
+                        index
+                    )
+                    candidate_prompts.append(
+                        prompt_text
+                    )
+
+                if (
+                    received_indices
+                    != expected_indices
+                ):
+                    raise ValueError(
+                        "refinement changed scene "
+                        "indices: "
+                        f"expected={expected_indices}, "
+                        f"received={received_indices}"
+                    )
+
+                if artifact_errors:
+                    raise ValueError(
+                        "linguistic expansion artifacts "
+                        "remain: "
+                        + " | ".join(
+                            artifact_errors
+                        )
+                    )
+
+                refined_batch = (
+                    candidate_prompts
+                )
+                break
+
+            except Exception as exc:
+                last_error = exc
+
+                logger.warning(
+                    "expanded Scene Prompt refinement "
+                    f"batch "
+                    f"{batch_number}/"
+                    f"{batch_count} failed: "
+                    f"{exc}"
+                )
+
+                if attempt < 2:
+                    if parsed_data is not None:
+                        current_prompt = f"""
+# Role: Expansion Artifact Repair Editor
+
+## Goal
+The previous copy-edit still contains a grammar artifact caused by mechanical
+Subject Anchor expansion.
+
+Repair ONLY the reported linguistic problem. Do not regenerate the scenes.
+
+## Validation Error
+{str(exc)}
+
+## Previous Refined JSON
+{json.dumps(parsed_data, ensure_ascii=False)}
+
+## Original Expanded Prompts
+{json.dumps(indexed_batch, ensure_ascii=False)}
+
+## Repair Rules
+1. Preserve exactly {len(indexed_batch)} scenes.
+2. Preserve these exact indices and order:
+   {", ".join(str(index) for index in expected_indices)}
+3. Fix every linguistic artifact named in Validation Error.
+4. A long expanded subject description must not directly receive 's or ?s.
+   Rephrase naturally using constructions such as "the hand of ...",
+   "the face of ...", "the shoulder of ...", or another grammatically
+   equivalent construction.
+5. Fix duplicated or incompatible articles such as "the open a ...".
+6. Remove only accidental immediate repetition caused by expansion.
+7. Preserve all subjects, objects, actions, camera framing, lighting,
+   atmosphere, chronology, and story facts.
+8. Add nothing and remove nothing semantically.
+9. Return ONLY the complete corrected JSON object.
+10. Do not add markdown, commentary, code fences, or explanations.
+""".strip()
+
+                        logger.warning(
+                            "expanded Scene Prompt "
+                            "refinement "
+                            f"batch "
+                            f"{batch_number}/"
+                            f"{batch_count}, "
+                            "repairing previous "
+                            "response... 1"
+                        )
+
+                    else:
+                        current_prompt = (
+                            generation_prompt
+                        )
+
+                        logger.warning(
+                            "expanded Scene Prompt "
+                            "refinement "
+                            f"batch "
+                            f"{batch_number}/"
+                            f"{batch_count}, "
+                            "trying again... 1"
+                        )
+
+        if refined_batch is None:
+            logger.warning(
+                "expanded Scene Prompt refinement "
+                f"batch "
+                f"{batch_number}/"
+                f"{batch_count} fell back to "
+                "the unrefined expanded prompts: "
+                f"{last_error}"
+            )
+
+            refined_batch = expanded_batch
+
+        refined_prompts.extend(
+            refined_batch
+        )
+
+    return refined_prompts
+
 def generate_subject_anchors_and_scene_prompts(
     visual_prompts,
     video_subject: str = "",
@@ -1025,11 +1583,11 @@ def generate_subject_anchors_and_scene_prompts(
     app_config=None,
 ) -> dict:
     """
-    Convert visual prompts into reusable continuity anchors plus anchored scene prompts.
+    Build one global Subject Anchor library, then rewrite Scene Prompts in
+    small batches against that fixed library.
 
-    The output always preserves the exact number and order of the source prompts. Stable
-    identity belongs in Subject Anchors; transient action, framing, lighting, and mood stay
-    in the individual Scene Prompts.
+    Separating anchor discovery from scene rewriting keeps identity global
+    while avoiding one very large structured LLM response.
     """
     prompts = _normalize_visual_prompt_lines(visual_prompts)
     indexed_prompts = [
@@ -1037,31 +1595,147 @@ def generate_subject_anchors_and_scene_prompts(
         for index, prompt in enumerate(prompts, start=1)
     ]
     clean_script = utils.remove_pause_tags(video_script or "").strip()
-    prompt = f"""
-# Role: Visual Continuity Editor
+    batch_size = 8
+
+    def call_json(prompt_text: str) -> str:
+        if app_config is None:
+            return _generate_response(
+                prompt_text,
+                json_mode=True,
+            )
+        return _generate_response(
+            prompt_text,
+            app_config=app_config,
+            json_mode=True,
+        )
+
+    def request_json_with_retries(
+        prompt_text: str,
+        *,
+        label: str,
+        validator=None,
+        repair_prompt_builder=None,
+    ):
+        """
+        Generate structured JSON, validate it, and repair semantic failures.
+
+        Parsing failures retry the original generation prompt. Once valid JSON
+        exists, validator failures can instead feed the previous response and
+        exact validation error into a focused repair pass.
+        """
+        last_error = None
+        current_prompt = prompt_text
+
+        for attempt in range(1, _max_retries + 1):
+            parsed_data = None
+
+            try:
+                response = call_json(current_prompt)
+
+                if response.startswith("Error: "):
+                    raise ValueError(
+                        response.removeprefix("Error: ").strip()
+                        or "unknown LLM error"
+                    )
+
+                parsed_data = _load_json_object_response(response)
+                data = parsed_data
+
+                if validator is not None:
+                    data = validator(data)
+
+                return data
+
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    f"{label} failed: {exc}"
+                )
+
+                if attempt < _max_retries:
+                    if (
+                        repair_prompt_builder is not None
+                        and parsed_data is not None
+                    ):
+                        try:
+                            current_prompt = repair_prompt_builder(
+                                parsed_data,
+                                exc,
+                            )
+                            logger.warning(
+                                f"{label}, repairing previous response... "
+                                f"{attempt}"
+                            )
+                        except Exception as repair_exc:
+                            logger.warning(
+                                f"{label} could not build repair prompt: "
+                                f"{repair_exc}; regenerating original request"
+                            )
+                            current_prompt = prompt_text
+                    else:
+                        current_prompt = prompt_text
+                        logger.warning(
+                            f"{label}, trying again... {attempt}"
+                        )
+
+        logger.error(
+            f"{label} failed after {_max_retries} attempts: "
+            f"{last_error}"
+        )
+        return None
+
+    # --------------------------------------------------------
+    # Stage 1: build the global anchor library only.
+    # --------------------------------------------------------
+
+    anchor_prompt = f"""
+# Role: Visual Continuity Anchor Editor
 
 ## Goal
-Turn the supplied Visual Prompts into a reusable Subject Anchor library and rewrite every
-scene to reference those anchors. This is prompt preprocessing for image/video generation;
-do not invent a new story or change scene order.
+Create one compact global Subject Anchor library for the supplied Visual
+Prompts. Do NOT rewrite the scenes yet.
 
 ## Output Format
-Return ONLY one valid JSON object with exactly these two keys:
-1. "subject_anchors": an array of objects with exactly "tag" and "description".
-2. "scene_prompts": an array of objects with exactly "index" and "prompt".
+Return ONLY one valid JSON object with exactly one key:
+
+"subject_anchors": an array of objects with exactly:
+- "tag"
+- "description"
+
+Example:
+{{
+  "subject_anchors": [
+    {{
+      "tag": "CHAR_1",
+      "description": "a middle-aged man with short dark hair wearing a gray sleep shirt"
+    }},
+    {{
+      "tag": "OBJ_1",
+      "description": "an old red rotary telephone with worn paint and a heavy receiver"
+    }}
+  ]
+}}
 
 ## Constraints
-1. Preserve exactly {len(prompts)} Scene Prompts, with indices 1 through {len(prompts)} in that exact order.
-2. Never merge, split, omit, duplicate, or reorder scenes.
-3. Allowed anchor tags are only CHAR_n, LOC_n, OBJ_n, VEH_n, and CREATURE_n, where n starts at 1.
-4. Use CHAR for people or characters; LOC for locations, backgrounds, rooms, buildings, exteriors, or environments; OBJ for objects, props, doors, windows, machines, devices, or visually distinctive structures; VEH for vehicles; CREATURE for non-human creatures.
-5. Create anchors for recurring visual elements whose stable appearance helps continuity. Also create an anchor for a visually distinctive or narratively important object, structure, doorway, prop, vehicle, creature, or location even if it appears in only one scene when preserving its identity would improve continuity, spatial understanding, framing, or later reuse. Prioritize the main character, important locations/backgrounds, distinctive recurring objects, and story-critical visual elements. Do not create anchors for generic disposable details that have no meaningful visual identity.
-6. Treat visually distinct interiors and exteriors as separate LOC anchors when they represent meaningfully different environments. For example, the exterior of an isolated building and its interior broadcast room should normally use different LOC anchors when both are visually important. Anchor descriptions must contain stable visible identity only: age range, build, hair, clothing, materials, colors, architecture, shape, wear, layout, or other persistent traits. Write every anchor description as a compact noun phrase rather than a complete sentence; begin with a lowercase article such as "a" or "an" when natural, and do not end the description with punctuation. Do not bake temporary poses, expressions, camera angles, scene-specific lighting, damage states, or actions into an anchor unless they are permanently defining features. Do not include carried items, held props, temporary accessories, or scene-specific possessions in a character anchor unless they are a permanent defining part of that character's design. If source prompts disagree about a detail, keep only traits that are consistent across appearances; never invent a new trait just to resolve the conflict.
-7. Rewritten Scene Prompts must use [TAG] references instead of repeating the anchored element's full identity description, while preserving that scene's action, composition, lighting, atmosphere, and transient state. Treat each [TAG] as a complete noun phrase. Do not attach possessive endings directly to a tag such as [CHAR_1]'s or [OBJ_1]'s. Rewrite the sentence so the tag acts as a grammatical subject or object. For example, prefer "[CHAR_1] turns the knob by hand" over "[CHAR_1]'s hand turns the knob", and prefer "Close-up of [OBJ_1], focusing on its glowing dial" over "Close-up of [OBJ_1]'s glowing dial".
-8. Every [TAG] used in a Scene Prompt must be defined in subject_anchors, and every generated Subject Anchor must be used by at least one Scene Prompt.
-9. Keep Scene Prompts in English. Do not add a global art style; the downstream ComfyUI prompt template handles style.
-10. Do not add markdown, commentary, code fences, captions, subtitles, logos, or explanatory text.
-11. Treat the original Visual Prompts as authoritative. The script and subject are context only and must not cause you to add, remove, or reorder scenes.
+1. Allowed tags are only CHAR_n, LOC_n, OBJ_n, VEH_n, and CREATURE_n.
+2. Number each category consecutively starting at 1.
+3. Create anchors for recurring or story-critical visible elements whose stable
+   identity materially improves continuity.
+4. Prioritize recurring characters, important locations, distinctive objects,
+   vehicles, creatures, doors, structures, and other visually important props.
+5. Do not create anchors for generic disposable details.
+6. Every anchor you create must correspond to something that can actually be
+   referenced in at least one supplied Visual Prompt.
+7. Anchor descriptions contain only stable visible identity: appearance,
+   materials, colors, architecture, clothing, shape, age range, wear, or layout.
+8. Do not include temporary actions, poses, expressions, camera angles,
+   lighting, damage states, or scene-specific conditions.
+9. Do not include carried or held items in a character anchor unless they are
+   permanently defining.
+10. Descriptions must be compact noun phrases and must not contain [TAG]
+    references.
+11. Do not add markdown, commentary, code fences, or explanations.
+12. Do not rewrite or return Scene Prompts in this step.
 
 ## Video Subject
 {video_subject}
@@ -1069,45 +1743,367 @@ Return ONLY one valid JSON object with exactly these two keys:
 ## Video Script Context
 {clean_script}
 
-## Visual Prompts (authoritative order)
+## Visual Prompts
 {json.dumps(indexed_prompts, ensure_ascii=False)}
 """.strip()
 
     logger.info(
-        "generating Subject Anchors and Scene Prompts: "
+        "generating global Subject Anchors: "
         f"scene_count={len(prompts)}"
     )
-    response = ""
-    for i in range(_max_retries):
-        try:
-            if app_config is None:
-                response = _generate_response(prompt)
-            else:
-                response = _generate_response(prompt, app_config=app_config)
-            if response.startswith("Error: "):
-                logger.error(f"failed to generate visual continuity plan: {response}")
-                return {}
-            plan = _normalize_visual_anchor_plan(
-                _load_json_object_response(response),
-                expected_scene_count=len(prompts),
-            )
-            logger.success(
-                "completed visual continuity plan: "
-                f"anchors={plan['anchor_count']}, scenes={plan['scene_count']}"
-            )
-            return plan
-        except Exception as exc:
-            logger.warning(
-                "failed to generate visual continuity plan: "
-                f"{str(exc)}"
-            )
-        if i < _max_retries - 1:
-            logger.warning(
-                "failed to generate visual continuity plan, trying again... "
-                f"{i + 1}"
+
+    def validate_anchor_data(data):
+        raw_anchors = data.get("subject_anchors")
+
+        if not isinstance(raw_anchors, list):
+            raise ValueError(
+                "subject_anchors must be a JSON array"
             )
 
-    return {}
+        validated_anchors = []
+        validated_tags = set()
+
+        for raw_anchor in raw_anchors:
+            if not isinstance(raw_anchor, dict):
+                raise ValueError(
+                    "each Subject Anchor must be a JSON object"
+                )
+
+            tag = str(
+                raw_anchor.get("tag") or ""
+            ).strip()
+
+            if tag.startswith("[") and tag.endswith("]"):
+                tag = tag[1:-1].strip()
+
+            description = str(
+                raw_anchor.get("description") or ""
+            ).strip()
+
+            if not _VISUAL_ANCHOR_TAG_RE.fullmatch(tag):
+                raise ValueError(
+                    f"invalid Subject Anchor tag: [{tag or '?'}]"
+                )
+
+            if tag in validated_tags:
+                raise ValueError(
+                    f"Subject Anchor [{tag}] is defined more than once"
+                )
+
+            if not description:
+                raise ValueError(
+                    f"Subject Anchor [{tag}] has an empty description"
+                )
+
+            if _VISUAL_ANCHOR_REFERENCE_RE.search(description):
+                raise ValueError(
+                    f"Subject Anchor [{tag}] description must not "
+                    "contain anchor references"
+                )
+
+            validated_tags.add(tag)
+            validated_anchors.append(
+                {
+                    "tag": tag,
+                    "description": description,
+                }
+            )
+
+        return {
+            "subject_anchors": validated_anchors
+        }
+
+    anchor_data = request_json_with_retries(
+        anchor_prompt,
+        label="global Subject Anchor generation",
+        validator=validate_anchor_data,
+    )
+
+    if anchor_data is None:
+        return {}
+
+    anchors = anchor_data["subject_anchors"]
+    defined_tags = {
+        anchor["tag"] for anchor in anchors
+    }
+
+    logger.info(
+        "global Subject Anchors created: "
+        f"anchor_count={len(anchors)}"
+    )
+
+    # --------------------------------------------------------
+    # Stage 2: rewrite scenes in small batches while keeping
+    # the exact same global anchor library for every batch.
+    # --------------------------------------------------------
+
+    scene_objects = []
+    batch_count = math.ceil(len(indexed_prompts) / batch_size)
+
+    for batch_number, batch_start in enumerate(
+        range(0, len(indexed_prompts), batch_size),
+        start=1,
+    ):
+        batch = indexed_prompts[
+            batch_start : batch_start + batch_size
+        ]
+
+        first_index = batch[0]["index"]
+        last_index = batch[-1]["index"]
+
+        scene_prompt = f"""
+# Role: Visual Continuity Scene Editor
+
+## Goal
+Rewrite ONLY the supplied batch of Visual Prompts using the fixed global
+Subject Anchor library below.
+
+The Subject Anchor library is authoritative. Do not create, rename, delete,
+renumber, or redefine anchors.
+
+## Output Format
+Return ONLY one valid JSON object with exactly one key:
+
+"scene_prompts": an array of objects with exactly:
+- "index"
+- "prompt"
+
+Preserve the original global scene indices exactly.
+
+## Fixed Subject Anchors
+{json.dumps(anchors, ensure_ascii=False)}
+
+## Constraints
+1. Return exactly {len(batch)} Scene Prompts.
+2. Preserve these exact scene indices and order:
+   {", ".join(str(item["index"]) for item in batch)}
+3. Never merge, split, omit, duplicate, or reorder scenes.
+4. Use [TAG] references whenever a fixed Subject Anchor represents an element
+   appearing in that scene.
+5. Use only tags defined in the Fixed Subject Anchors above.
+6. Do not invent new anchors.
+7. Replace repeated identity descriptions with [TAG], while preserving the
+   scene's action, composition, framing, lighting, atmosphere, and transient
+   state.
+8. Treat every [TAG] as a complete noun phrase and keep the surrounding
+   sentence grammatically natural.
+9. Keep every Scene Prompt in English.
+10. Do not add a global art style.
+11. Do not add markdown, commentary, code fences, captions, subtitles, logos,
+    or explanatory text.
+12. The source Visual Prompts are authoritative. Do not invent a new story.
+
+## Video Subject
+{video_subject}
+
+## Source Visual Prompts for this batch
+{json.dumps(batch, ensure_ascii=False)}
+""".strip()
+
+        logger.info(
+            "generating anchored Scene Prompts "
+            f"batch {batch_number}/{batch_count}: "
+            f"scenes {first_index}-{last_index}"
+        )
+
+        def validate_scene_batch_data(data):
+            raw_scenes = data.get("scene_prompts")
+
+            if not isinstance(raw_scenes, list):
+                raise ValueError(
+                    "scene_prompts must be a JSON array"
+                )
+
+            if len(raw_scenes) != len(batch):
+                raise ValueError(
+                    "Scene Prompt batch changed scene count: "
+                    f"expected={len(batch)}, "
+                    f"received={len(raw_scenes)}"
+                )
+
+            expected_indices = [
+                item["index"] for item in batch
+            ]
+            received_indices = []
+            validated_scenes = []
+
+            for raw_scene in raw_scenes:
+                if not isinstance(raw_scene, dict):
+                    raise ValueError(
+                        "each Scene Prompt must be a JSON object"
+                    )
+
+                try:
+                    index = int(raw_scene.get("index"))
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(
+                        "each Scene Prompt index must be an integer"
+                    ) from exc
+
+                prompt_text = str(
+                    raw_scene.get("prompt") or ""
+                ).strip()
+
+                if not prompt_text:
+                    raise ValueError(
+                        f"Scene Prompt {index} is empty"
+                    )
+
+                references = set(
+                    _VISUAL_ANCHOR_REFERENCE_RE.findall(
+                        prompt_text
+                    )
+                )
+
+                undefined = sorted(
+                    references - defined_tags
+                )
+
+                if undefined:
+                    raise ValueError(
+                        "Scene Prompt references undefined "
+                        "Subject Anchor(s): "
+                        + ", ".join(
+                            f"[{tag}]"
+                            for tag in undefined
+                        )
+                    )
+
+                received_indices.append(index)
+                validated_scenes.append(
+                    {
+                        "index": index,
+                        "prompt": prompt_text,
+                    }
+                )
+
+            if received_indices != expected_indices:
+                raise ValueError(
+                    "Scene Prompt indices changed: "
+                    f"expected={expected_indices}, "
+                    f"received={received_indices}"
+                )
+
+            return {
+                "scene_prompts": validated_scenes
+            }
+
+        def build_scene_batch_repair_prompt(
+            previous_data,
+            validation_error,
+        ):
+            """
+            Repair an already generated scene batch instead of regenerating it.
+
+            The repair model receives the exact invalid JSON and validator
+            feedback so it can make the smallest possible correction.
+            """
+            return f"""
+# Role: Scene Prompt Repair Editor
+
+## Goal
+Repair the previous JSON response so it passes validation.
+
+The previous response already represents the intended scenes. Do NOT regenerate
+the batch from scratch. Preserve everything that is already valid and change
+only what is necessary to resolve the validation error.
+
+## Validation Error
+{str(validation_error)}
+
+## Previous JSON Response
+{json.dumps(previous_data, ensure_ascii=False)}
+
+## Fixed Subject Anchors
+{json.dumps(anchors, ensure_ascii=False)}
+
+## Required Scene Indices
+{", ".join(str(item["index"]) for item in batch)}
+
+## Repair Rules
+1. Preserve exactly {len(batch)} scenes and the exact indices shown above.
+2. Preserve the meaning, actions, objects, composition, framing, lighting,
+   atmosphere, chronology, and continuity of every scene.
+3. Preserve all valid Subject Anchor tags. Do not create, rename, renumber,
+   delete, or redefine anchors.
+4. Treat the Validation Error above as authoritative and fix only that error.
+5. Do not simplify or rewrite unrelated parts of a Scene Prompt.
+6. Preserve valid anchor references exactly as they appear.
+7. Return ONLY the complete corrected JSON object.
+8. Do not add markdown, commentary, code fences, or explanations.
+""".strip()
+
+        scene_data = request_json_with_retries(
+            scene_prompt,
+            label=(
+                "anchored Scene Prompt batch "
+                f"{batch_number}/{batch_count}"
+            ),
+            validator=validate_scene_batch_data,
+            repair_prompt_builder=build_scene_batch_repair_prompt,
+        )
+
+        if scene_data is None:
+            return {}
+
+        scene_objects.extend(
+            scene_data["scene_prompts"]
+        )
+
+    # --------------------------------------------------------
+    # Stage 3: discard anchors that no generated scene uses.
+    #
+    # An unused anchor has no downstream effect and keeping it
+    # would make the existing global validator reject an
+    # otherwise valid continuity plan.
+    # --------------------------------------------------------
+
+    referenced_tags = set()
+
+    for scene in scene_objects:
+        referenced_tags.update(
+            _VISUAL_ANCHOR_REFERENCE_RE.findall(
+                scene["prompt"]
+            )
+        )
+
+    used_anchors = [
+        anchor
+        for anchor in anchors
+        if anchor["tag"] in referenced_tags
+    ]
+
+    removed_count = len(anchors) - len(used_anchors)
+
+    if removed_count:
+        logger.info(
+            "discarded unused Subject Anchors after "
+            f"scene rewriting: count={removed_count}"
+        )
+
+    try:
+        plan = _normalize_visual_anchor_plan(
+            {
+                "subject_anchors": used_anchors,
+                "scene_prompts": scene_objects,
+            },
+            expected_scene_count=len(prompts),
+        )
+    except Exception as exc:
+        logger.error(
+            "combined visual continuity plan failed "
+            f"final validation: {exc}"
+        )
+        return {}
+
+    logger.success(
+        "completed visual continuity plan: "
+        f"anchors={plan['anchor_count']}, "
+        f"scenes={plan['scene_count']}, "
+        f"batches={batch_count}"
+    )
+
+    return plan
 
 
 def generate_terms(

@@ -263,6 +263,46 @@ class TestVoiceService(unittest.TestCase):
         audio_duration = vs.get_audio_duration(sub_maker)
         print(f"voice: {voice_name}, audio duration: {audio_duration}s")
 
+    def test_convert_pitch_to_hz_normalizes_and_clamps(self):
+        self.assertEqual(vs.convert_pitch_to_hz(-50), "-50Hz")
+        self.assertEqual(vs.convert_pitch_to_hz(0), "+0Hz")
+        self.assertEqual(vs.convert_pitch_to_hz(35), "+35Hz")
+        self.assertEqual(vs.convert_pitch_to_hz(999), "+100Hz")
+        self.assertEqual(vs.convert_pitch_to_hz(-999), "-100Hz")
+        self.assertEqual(vs.convert_pitch_to_hz(None), "+0Hz")
+        self.assertEqual(vs.convert_pitch_to_hz("invalid"), "+0Hz")
+        self.assertEqual(vs.convert_pitch_to_hz(float("nan")), "+0Hz")
+
+    def test_create_edge_tts_communicate_passes_pitch_when_supported(self):
+        class _ModernCommunicate:
+            def __init__(
+                self,
+                text,
+                voice,
+                rate="+0%",
+                pitch="+0Hz",
+                boundary=None,
+            ):
+                self.text = text
+                self.voice = voice
+                self.rate = rate
+                self.pitch = pitch
+                self.boundary = boundary
+
+        with patch.object(vs.edge_tts, "Communicate", _ModernCommunicate):
+            communicate = vs.create_edge_tts_communicate(
+                "pitch test",
+                "en-US-TestNeural",
+                "+10%",
+                "-30Hz",
+            )
+
+        self.assertEqual(communicate.text, "pitch test")
+        self.assertEqual(communicate.voice, "en-US-TestNeural")
+        self.assertEqual(communicate.rate, "+10%")
+        self.assertEqual(communicate.pitch, "-30Hz")
+        self.assertEqual(communicate.boundary, "WordBoundary")
+
     def test_azure_tts_v1_supports_legacy_edge_tts_without_boundary(self):
         """
         验证 Azure TTS V1 在旧版 edge_tts 依赖残留时仍可继续工作。
@@ -309,6 +349,7 @@ class TestVoiceService(unittest.TestCase):
                 voice_name="zh-CN-XiaoyiNeural-Female",
                 voice_file=voice_file,
                 voice_rate=1.0,
+                voice_pitch=20,
             )
 
             self.assertIsNotNone(sub_maker)
@@ -1616,7 +1657,7 @@ class TestElevenLabsVoice(unittest.TestCase):
         fake_sub2.subs = ["Segment 2"]
         fake_sub2.offset = [(2000000, 18000000)]
 
-        def fake_single_tts(text, voice_name, voice_rate, voice_file, voice_volume=1.0):
+        def fake_single_tts(text, voice_name, voice_rate, voice_file, voice_volume=1.0, voice_pitch=0.0):
             if "Segment 1" in text:
                 _write_test_wav(voice_file, 1.5)
                 return fake_sub1
@@ -1709,7 +1750,7 @@ class TestElevenLabsVoice(unittest.TestCase):
         fake_sub.subs = ["Hello"]
         fake_sub.offset = [(1000000, 12000000)]
 
-        def fake_single_tts(text, voice_name, voice_rate, voice_file, voice_volume=1.0):
+        def fake_single_tts(text, voice_name, voice_rate, voice_file, voice_volume=1.0, voice_pitch=0.0):
             _write_test_wav(voice_file, 1.2)
             return fake_sub
 
@@ -1985,7 +2026,7 @@ class TestElevenLabsVoice(unittest.TestCase):
             return sub
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            def real_single_tts_wav(text, voice_name, voice_rate, voice_file, voice_volume=1.0):
+            def real_single_tts_wav(text, voice_name, voice_rate, voice_file, voice_volume=1.0, voice_pitch=0.0):
                 # 写入真实的 1 秒 WAV 音频数据
                 with wave.open(voice_file, "wb") as wf:
                     wf.setnchannels(1)
@@ -2053,7 +2094,7 @@ class TestElevenLabsVoice(unittest.TestCase):
             Subtitle(1, timedelta(seconds=0.0), timedelta(seconds=1.0), "Hello"),
         ]
 
-        def fake_single_tts_empty(text, voice_name, voice_rate, voice_file, voice_volume=1.0):
+        def fake_single_tts_empty(text, voice_name, voice_rate, voice_file, voice_volume=1.0, voice_pitch=0.0):
             Path(voice_file).touch()  # 0-byte empty file
             return fake_sub
 
@@ -2077,7 +2118,7 @@ class TestElevenLabsVoice(unittest.TestCase):
             Subtitle(1, timedelta(seconds=0.0), timedelta(seconds=1.0), "Hello"),
         ]
 
-        def fake_single_tts_corrupted(text, voice_name, voice_rate, voice_file, voice_volume=1.0):
+        def fake_single_tts_corrupted(text, voice_name, voice_rate, voice_file, voice_volume=1.0, voice_pitch=0.0):
             with open(voice_file, "wb") as f:
                 f.write(b"NOT_A_VALID_AUDIO_FILE_DATA_CORRUPTED_1234567890")
             return fake_sub

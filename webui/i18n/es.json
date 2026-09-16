@@ -418,6 +418,9 @@
     "OFox Upstream Vendor Help": "Qué proveedor upstream sirve la generación de vídeo de OFox. BytePlus (internacional) es el predeterminado, con una política de contenido consistente; Volcano Engine es el proveedor de China continental; Auto deja que la pasarela de OFox balancee la carga entre proveedores.",
     "OFox Vendor BytePlus": "BytePlus (internacional, predeterminado)",
     "OFox Vendor Volcengine": "Volcano Engine (China continental)",
-    "OFox Vendor Auto": "Auto (balanceo de la pasarela)"
+    "OFox Vendor Auto": "Auto (balanceo de la pasarela)",
+    "Voiceover Pitch": "Tono de voz (Edge TTS)",
+    "Voiceover Pitch Help": "Solo para Edge TTS. Los valores negativos hacen la voz más grave y los positivos la hacen más aguda. 0 Hz conserva el tono original.",
+    "Voiceover Pitch Scale": "Más grave ← 0 Hz → Más agudo"
   }
 }

@@ -629,6 +629,9 @@
     "Visual Shot Planning Failed": "Visual Shot Planning Failed",
     "{count} Visual Prompts from Active Shot Plan are applied.": "{count} Visual Prompts from Active Shot Plan are applied.",
     "{count} active shots remain below the preferred minimum because no safe boundary adjustment can remove them without breaking the hard maximum.": "{count} active shots remain below the preferred minimum because no safe boundary adjustment can remove them without breaking the hard maximum.",
-    "{count} active shots still use an internal duration-limit cut because no validated narration/alignment boundary was available at a safe position.": "{count} active shots still use an internal duration-limit cut because no validated narration/alignment boundary was available at a safe position."
+    "{count} active shots still use an internal duration-limit cut because no validated narration/alignment boundary was available at a safe position.": "{count} active shots still use an internal duration-limit cut because no validated narration/alignment boundary was available at a safe position.",
+    "Voiceover Pitch": "Voice Pitch (Edge TTS)",
+    "Voiceover Pitch Help": "Edge TTS only. Negative values make the voice deeper; positive values make it higher. 0 Hz keeps the original pitch.",
+    "Voiceover Pitch Scale": "Deeper ← 0 Hz → Higher"
   }
 }

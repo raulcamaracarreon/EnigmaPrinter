@@ -593,6 +593,7 @@ def _single_tts(
     voice_rate: float,
     voice_file: str,
     voice_volume: float = 1.0,
+    voice_pitch: float = 0.0,
 ) -> Union[SubMaker, None]:
     if is_no_voice(voice_name):
         duration_seconds = estimate_no_voice_duration(text)
@@ -704,7 +705,13 @@ def _single_tts(
             return voxcpm_tts(text, voice_id, voice_file, voice_rate, voice_volume)
         logger.error(f"Invalid VoxCPM voice name format: {voice_name}")
         return None
-    return azure_tts_v1(text, voice_name, voice_rate, voice_file)
+    return azure_tts_v1(
+        text,
+        voice_name,
+        voice_rate,
+        voice_file,
+        voice_pitch=voice_pitch,
+    )
 
 
 def _concat_audio_files(audio_files: list[str], output_file: str) -> bool:
@@ -816,6 +823,7 @@ def _tts_with_pauses(
     voice_rate: float,
     voice_file: str,
     voice_volume: float = 1.0,
+    voice_pitch: float = 0.0,
 ) -> Union[SubMaker, None]:
     """
     处理包含停顿标签（如 [pause: 2s] / [pausa: 1.5s] / [停顿: 3秒]）的脚本合成。
@@ -830,7 +838,14 @@ def _tts_with_pauses(
 
     if not pause_segments:
         clean_text = utils.remove_pause_tags(text)
-        return _single_tts(clean_text, voice_name, voice_rate, voice_file, voice_volume)
+        return _single_tts(
+            clean_text,
+            voice_name,
+            voice_rate,
+            voice_file,
+            voice_volume,
+            voice_pitch,
+        )
 
     if not speech_segments:
         total_pause_duration = sum(float(s[1]) for s in pause_segments)
@@ -889,6 +904,7 @@ def _tts_with_pauses(
                     voice_rate=voice_rate,
                     voice_file=chunk_audio_file,
                     voice_volume=voice_volume,
+                    voice_pitch=voice_pitch,
                 )
                 if not chunk_submaker or not os.path.exists(chunk_audio_file) or os.path.getsize(chunk_audio_file) == 0:
                     logger.error(
@@ -977,6 +993,7 @@ def tts(
     voice_rate: float,
     voice_file: str,
     voice_volume: float = 1.0,
+    voice_pitch: float = 0.0,
 ) -> Union[SubMaker, None]:
     # 无停顿标签时，原样直通原始文本，避免无意义的正则处理或空白截断
     if not utils.has_pause_tags(text):
@@ -986,6 +1003,7 @@ def tts(
             voice_rate=voice_rate,
             voice_file=voice_file,
             voice_volume=voice_volume,
+            voice_pitch=voice_pitch,
         )
 
     # 仅 Azure TTS v1 (Edge TTS) 且脚本包含停顿标签时进入分段合成
@@ -996,6 +1014,7 @@ def tts(
             voice_rate=voice_rate,
             voice_file=voice_file,
             voice_volume=voice_volume,
+            voice_pitch=voice_pitch,
         )
 
     # 其他声音提供商（如 Gemini、Fish Audio、SiliconFlow、Kokoro）包含停顿标签时，
@@ -1007,6 +1026,7 @@ def tts(
         voice_rate=voice_rate,
         voice_file=voice_file,
         voice_volume=voice_volume,
+        voice_pitch=voice_pitch,
     )
 
 
@@ -1028,6 +1048,21 @@ def convert_rate_to_percent(rate: float) -> str:
     if percent >= 0:
         return f"+{percent}%"
     return f"{percent}%"
+
+
+def convert_pitch_to_hz(pitch: float | int | None) -> str:
+    """Convert an Edge TTS pitch value to a signed Hz string."""
+    try:
+        pitch_value = float(pitch or 0)
+    except (TypeError, ValueError, OverflowError):
+        pitch_value = 0.0
+
+    if not math.isfinite(pitch_value):
+        pitch_value = 0.0
+
+    pitch_value = int(round(pitch_value))
+    pitch_value = max(-100, min(100, pitch_value))
+    return f"{pitch_value:+d}Hz"
 
 
 def ensure_file_path_exists(file_path: str) -> None:
@@ -1210,7 +1245,10 @@ def populate_legacy_submaker_with_full_text(
 
 
 def create_edge_tts_communicate(
-    text: str, voice_name: str, rate_str: str
+    text: str,
+    voice_name: str,
+    rate_str: str,
+    pitch_str: str = "+0Hz",
 ) -> edge_tts.Communicate:
     """
     按当前已安装的 edge_tts 版本构造 Communicate 对象。
@@ -1226,6 +1264,9 @@ def create_edge_tts_communicate(
     """
     communicate_kwargs = {"rate": rate_str}
     communicate_signature = inspect.signature(edge_tts.Communicate)
+
+    if "pitch" in communicate_signature.parameters:
+        communicate_kwargs["pitch"] = pitch_str
 
     if "boundary" in communicate_signature.parameters:
         communicate_kwargs["boundary"] = "WordBoundary"
@@ -1367,11 +1408,16 @@ def stream_edge_tts_chunks(
 
 
 def azure_tts_v1(
-    text: str, voice_name: str, voice_rate: float, voice_file: str
+    text: str,
+    voice_name: str,
+    voice_rate: float,
+    voice_file: str,
+    voice_pitch: float = 0.0,
 ) -> Union[SubMaker, None]:
     voice_name = parse_voice_name(voice_name)
     text = text.strip()
     rate_str = convert_rate_to_percent(voice_rate)
+    pitch_str = convert_pitch_to_hz(voice_pitch)
     for i in range(3):
         try:
             logger.info(f"start, voice name: {voice_name}, try: {i + 1}")
@@ -1380,7 +1426,12 @@ def azure_tts_v1(
             # 1. 新版支持 `boundary` + `stream_sync()`
             # 2. 旧版不支持 `boundary`，且通常只暴露异步 `stream()`
             ensure_file_path_exists(voice_file)
-            communicate = create_edge_tts_communicate(text, voice_name, rate_str)
+            communicate = create_edge_tts_communicate(
+                text,
+                voice_name,
+                rate_str,
+                pitch_str,
+            )
             sub_maker = ensure_mpt_alignment_fields(edge_tts.SubMaker())
             timeout_seconds = get_edge_tts_timeout_seconds()
 

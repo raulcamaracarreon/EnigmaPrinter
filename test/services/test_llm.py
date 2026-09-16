@@ -1484,91 +1484,177 @@ class TestLiteLLMProvider(unittest.TestCase):
         )
         self.assertEqual(result, "hello\ngroq")
 
-    def _use_ollama_provider(self, base_url=""):
+    def _use_ollama_provider(self, base_url="", model_name="qwen3.5:9b"):
         config.app["llm_provider"] = "ollama"
         config.app["ollama_api_key"] = ""
         config.app["ollama_base_url"] = base_url
-        config.app["ollama_model_name"] = "llama3"
+        config.app["ollama_model_name"] = model_name
 
-    def _assert_ollama_base_url(self, expected_base_url: str):
-        class FakeCompletions:
-            def create(self, **kwargs):
-                self.kwargs = kwargs
-                message = types.SimpleNamespace(content="hello\nollama")
-                choice = types.SimpleNamespace(message=message)
-                return types.SimpleNamespace(choices=[choice])
+    def _assert_ollama_native_url(self, expected_url: str):
+        captured = {}
 
-        fake_completions = FakeCompletions()
-        fake_client = types.SimpleNamespace(
-            chat=types.SimpleNamespace(completions=fake_completions)
-        )
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "message": {
+                        "role": "assistant",
+                        "content": "hello\nollama",
+                    }
+                }
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return FakeResponse()
 
         with (
-            patch.object(llm, "OpenAI", return_value=fake_client) as openai_client,
-            patch.object(llm, "ChatCompletion", types.SimpleNamespace),
+            patch.object(llm.requests, "post", side_effect=fake_post) as post,
+            patch.object(llm, "OpenAI") as openai_client,
         ):
             result = llm._generate_response("Say hello")
 
-        openai_client.assert_called_once_with(
-            api_key="ollama",
-            base_url=expected_base_url,
-        )
+        post.assert_called_once()
+        openai_client.assert_not_called()
+        self.assertEqual(captured["url"], expected_url)
         self.assertEqual(
-            fake_completions.kwargs,
+            captured["json"],
             {
-                "model": "llama3",
+                "model": "qwen3.5:9b",
                 "messages": [{"role": "user", "content": "Say hello"}],
-                "extra_body": {"reasoning_effort": "none"},
+                "stream": False,
+                "think": False,
             },
         )
+        self.assertEqual(captured["timeout"], 300)
         self.assertEqual(result, "hello\nollama")
 
     def test_ollama_default_base_url_uses_localhost_outside_container(self):
-        """
-        普通本机运行时，Ollama 默认仍然使用 localhost，避免影响已有用户。
-        """
         self._use_ollama_provider()
 
         with patch.object(config, "is_running_in_container", return_value=False):
-            self._assert_ollama_base_url("http://localhost:11434/v1")
+            self._assert_ollama_native_url(
+                "http://localhost:11434/api/chat"
+            )
 
     def test_ollama_default_base_url_uses_host_gateway_inside_container(self):
-        """
-        容器内运行时，localhost 指向容器自身；默认改为 host.docker.internal，
-        方便 Docker Desktop 用户访问宿主机上的 Ollama。
-        """
         self._use_ollama_provider()
 
         with (
             patch.object(config, "is_running_in_container", return_value=True),
             patch.object(config, "_can_resolve_hostname", return_value=True),
         ):
-            self._assert_ollama_base_url("http://host.docker.internal:11434/v1")
+            self._assert_ollama_native_url(
+                "http://host.docker.internal:11434/api/chat"
+            )
 
     def test_ollama_default_base_url_falls_back_to_container_gateway(self):
-        """
-        原生 Linux Docker 里不一定能解析 host.docker.internal。此时使用容器
-        默认网关作为兜底地址，比直接返回不可解析的 hostname 更稳。
-        """
         self._use_ollama_provider()
 
         with (
             patch.object(config, "is_running_in_container", return_value=True),
             patch.object(config, "_can_resolve_hostname", return_value=False),
             patch.object(
-                config, "get_container_default_gateway_ip", return_value="172.17.0.1"
+                config,
+                "get_container_default_gateway_ip",
+                return_value="172.17.0.1",
             ),
         ):
-            self._assert_ollama_base_url("http://172.17.0.1:11434/v1")
+            self._assert_ollama_native_url(
+                "http://172.17.0.1:11434/api/chat"
+            )
 
     def test_ollama_explicit_base_url_takes_precedence(self):
-        """
-        用户手动配置的 ollama_base_url 优先级最高，不受容器检测影响。
-        """
-        self._use_ollama_provider(base_url="http://ollama:11434/v1")
+        self._use_ollama_provider(
+            base_url="http://ollama:11434/v1"
+        )
 
         with patch.object(config, "is_running_in_container", return_value=True):
-            self._assert_ollama_base_url("http://ollama:11434/v1")
+            self._assert_ollama_native_url(
+                "http://ollama:11434/api/chat"
+            )
+
+    def test_ollama_json_mode_uses_native_format(self):
+        self._use_ollama_provider()
+
+        captured = {}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "message": {
+                        "role": "assistant",
+                        "content": '{"shots":[]}',
+                    }
+                }
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return FakeResponse()
+
+        with patch.object(
+            llm.requests,
+            "post",
+            side_effect=fake_post,
+        ):
+            result = llm._generate_response(
+                "Return JSON",
+                json_mode=True,
+            )
+
+        self.assertEqual(
+            captured["json"]["format"],
+            "json",
+        )
+        self.assertEqual(
+            captured["json"]["options"],
+            {"temperature": 0},
+        )
+        self.assertFalse(captured["json"]["think"])
+        self.assertEqual(result, '{"shots":[]}')
+
+    def test_ollama_gpt_oss_uses_low_thinking(self):
+        self._use_ollama_provider(
+            model_name="gpt-oss:20b"
+        )
+
+        captured = {}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "message": {
+                        "role": "assistant",
+                        "content": "OK",
+                        "thinking": "hidden trace",
+                    }
+                }
+
+        def fake_post(url, **kwargs):
+            captured.update(kwargs)
+            return FakeResponse()
+
+        with patch.object(
+            llm.requests,
+            "post",
+            side_effect=fake_post,
+        ):
+            result = llm._generate_response("Reply OK")
+
+        self.assertEqual(
+            captured["json"]["think"],
+            "low",
+        )
+        self.assertEqual(result, "OK")
 
     def test_mimo_provider_uses_openai_compatible_client(self):
         """

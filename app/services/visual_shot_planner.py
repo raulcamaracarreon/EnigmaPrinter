@@ -6,9 +6,13 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
+from loguru import logger
+
 
 MAX_VISUAL_PROMPT_CHARS = 1200
 MAX_SHOTS_PER_REQUEST = 60
+MAX_VISUAL_SHOT_ATTEMPTS = 3
+VISUAL_SHOT_BATCH_SIZE = 8
 
 
 @dataclass(frozen=True)
@@ -86,15 +90,35 @@ def _strip_code_fence(text: str) -> str:
 
 def _parse_json_object(text: str) -> dict[str, Any]:
     cleaned = _strip_code_fence(text)
+    candidate = cleaned
+
     try:
-        value = json.loads(cleaned)
-    except Exception:
+        value = json.loads(candidate)
+    except json.JSONDecodeError:
         match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if not match:
-            raise ValueError("visual shot planner response does not contain a JSON object")
-        value = json.loads(match.group())
+            raise ValueError(
+                "visual shot planner response does not contain a JSON object"
+            )
+
+        candidate = match.group()
+
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            start = max(0, exc.pos - 200)
+            end = min(len(candidate), exc.pos + 200)
+            context = candidate[start:end].replace("\n", "\\n")
+
+            raise ValueError(
+                "visual shot planner returned invalid JSON at "
+                f"line {exc.lineno}, column {exc.colno}, char {exc.pos}; "
+                f"context={context!r}"
+            ) from exc
+
     if not isinstance(value, dict):
         raise ValueError("visual shot planner response is not a JSON object")
+
     return value
 
 
@@ -247,26 +271,123 @@ def generate_visual_shot_plan(
     video_subject: str = "",
 ) -> VisualShotPlan:
     payload = build_visual_shot_payload(base_plan)
-    response = response_generator(_build_prompt(payload, video_subject=video_subject))
-    prompts = _validate_llm_shots(_parse_json_object(response), len(payload))
+
+    prompts: dict[int, str] = {}
+    batch_count = math.ceil(len(payload) / VISUAL_SHOT_BATCH_SIZE)
+
+    for batch_number, batch_start in enumerate(
+        range(0, len(payload), VISUAL_SHOT_BATCH_SIZE),
+        start=1,
+    ):
+        source_batch = payload[
+            batch_start : batch_start + VISUAL_SHOT_BATCH_SIZE
+        ]
+
+        # The LLM sees compact local indices 1..N inside each batch.
+        # Results are mapped back to the authoritative global shot indices
+        # immediately after validation.
+        batch_payload: list[dict[str, Any]] = []
+
+        for local_index, item in enumerate(source_batch, start=1):
+            local_item = dict(item)
+            local_item["shot_index"] = local_index
+            batch_payload.append(local_item)
+
+        global_first = int(source_batch[0]["shot_index"])
+        global_last = int(source_batch[-1]["shot_index"])
+
+        logger.info(
+            "visual shot planner batch "
+            f"{batch_number}/{batch_count}: "
+            f"shots {global_first}-{global_last}"
+        )
+
+        prompt = _build_prompt(
+            batch_payload,
+            video_subject=video_subject,
+        )
+
+        batch_prompts = None
+
+        for attempt in range(1, MAX_VISUAL_SHOT_ATTEMPTS + 1):
+            try:
+                response = response_generator(prompt)
+
+                if str(response or "").startswith("Error:"):
+                    detail = str(response).removeprefix("Error:").strip()
+                    raise ValueError(
+                        "visual shot planner LLM request failed: "
+                        + (detail or "unknown LLM error")
+                    )
+
+                batch_prompts = _validate_llm_shots(
+                    _parse_json_object(response),
+                    len(batch_payload),
+                )
+                break
+
+            except (json.JSONDecodeError, ValueError) as exc:
+                if attempt >= MAX_VISUAL_SHOT_ATTEMPTS:
+                    raise
+
+                logger.warning(
+                    "visual shot planner batch "
+                    f"{batch_number}/{batch_count} rejected; "
+                    f"retrying {attempt}/"
+                    f"{MAX_VISUAL_SHOT_ATTEMPTS - 1}: {exc}"
+                )
+
+        if batch_prompts is None:
+            raise ValueError(
+                f"visual shot planner batch "
+                f"{batch_number}/{batch_count} "
+                "did not produce a valid response"
+            )
+
+        for local_index, item in enumerate(source_batch, start=1):
+            global_index = int(item["shot_index"])
+            prompts[global_index] = batch_prompts[local_index]
+
+    # Revalidate the combined result so completeness, global ordering,
+    # empty prompts and exact duplicates are still enforced across batches.
+    prompts = _validate_llm_shots(
+        {
+            "shots": [
+                {
+                    "shot_index": index,
+                    "visual_prompt": prompts[index],
+                }
+                for index in range(1, len(payload) + 1)
+            ]
+        },
+        len(payload),
+    )
 
     shots: list[VisualShot] = []
     shared_count = 0
+
     for item in payload:
         shared = bool(item["shared_narration_with_previous"])
         if shared:
             shared_count += 1
+
         shots.append(
             VisualShot(
                 index=int(item["shot_index"]),
                 start=float(item["start"]),
                 end=float(item["end"]),
                 duration=float(item["duration"]),
-                scene_indices=tuple(int(value) for value in item["scene_indices"]),
-                narration_indices=tuple(int(value) for value in item["narration_indices"]),
+                scene_indices=tuple(
+                    int(value) for value in item["scene_indices"]
+                ),
+                narration_indices=tuple(
+                    int(value) for value in item["narration_indices"]
+                ),
                 narration_text=str(item["narration_text"]),
                 shared_narration_with_previous=shared,
-                continues_same_scene=bool(item["continues_same_scene"]),
+                continues_same_scene=bool(
+                    item["continues_same_scene"]
+                ),
                 visual_prompt=prompts[int(item["shot_index"])],
             )
         )

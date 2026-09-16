@@ -1656,6 +1656,7 @@ def _apply_restored_params(params):
         _set_stable_widget_value(f"speech_synthesis_select_{tts_server}", voice_name)
     _set_stable_widget_value("voice_volume_select", params.get("voice_volume", 1.0))
     _set_stable_widget_value("voice_rate_select", params.get("voice_rate", 1.0))
+    _set_stable_widget_value("voice_pitch_slider", params.get("voice_pitch", 0.0))
     bgm_type = params.get("bgm_type") or ""
     _set_stable_widget_value("bgm_type_select", bgm_type)
     _set_stable_widget_value("bgm_volume_select", params.get("bgm_volume", 0.2))
@@ -4775,6 +4776,31 @@ def _effective_voice_rate_before_audio_panel():
 
 
 
+def _effective_voice_pitch_before_audio_panel() -> float:
+    """Read the current Edge TTS pitch before the audio panel is rendered."""
+    current_tts_server = st.session_state.get(
+        localized_widget_key("tts_server_select"),
+        config.ui.get("tts_server", "azure-tts-v1"),
+    )
+
+    if current_tts_server != "azure-tts-v1":
+        return 0.0
+
+    raw_pitch = st.session_state.get(
+        localized_widget_key("voice_pitch_slider"),
+        config.ui.get("voice_pitch", 0.0),
+    )
+    try:
+        pitch = float(raw_pitch)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+    if not math.isfinite(pitch):
+        return 0.0
+
+    return max(-50.0, min(50.0, pitch))
+
+
 def _effective_media_source_mode_before_video_panel() -> str:
     """Read the current single/hybrid strategy before the video panel is rendered."""
     mode = st.session_state.get(
@@ -4868,7 +4894,11 @@ def _recommended_visual_prompt_plan(
         "prompt_count": prompt_count,
     }
 
-def _matching_full_voice_preview_duration(script, voice_rate):
+def _matching_full_voice_preview_duration(
+    script,
+    voice_rate,
+    voice_pitch=0.0,
+):
     """仅在文案、Provider、音色和语速均未变化时采用完整试听的真实时长。"""
     cached = st.session_state.get("voice_preview_audio")
     if not isinstance(cached, dict) or cached.get("preview_type") != "full":
@@ -4887,13 +4917,16 @@ def _matching_full_voice_preview_duration(script, voice_rate):
     )
     try:
         cached_voice_rate = float(cached.get("voice_rate", 0))
+        cached_voice_pitch = float(cached.get("voice_pitch", 0))
     except (TypeError, ValueError, OverflowError):
         return None
     if (
         cached.get("tts_server") != current_tts_server
         or cached.get("voice_name") != current_voice_name
         or not math.isfinite(cached_voice_rate)
+        or not math.isfinite(cached_voice_pitch)
         or not math.isclose(cached_voice_rate, voice_rate)
+        or not math.isclose(cached_voice_pitch, voice_pitch)
     ):
         return None
 
@@ -4914,7 +4947,12 @@ def _loomloom_video_coverage_plan(params):
         return None
 
     voice_rate = _effective_voice_rate_before_audio_panel()
-    actual_duration = _matching_full_voice_preview_duration(script, voice_rate)
+    voice_pitch = _effective_voice_pitch_before_audio_panel()
+    actual_duration = _matching_full_voice_preview_duration(
+        script,
+        voice_rate,
+        voice_pitch,
+    )
     if actual_duration is not None:
         duration_min = duration_max = actual_duration
         basis_key = "AI Video Duration Basis Actual"
@@ -6627,6 +6665,7 @@ def _voice_preview_fingerprint(
     voice_name: str,
     voice_rate: float,
     voice_volume: float,
+    voice_pitch: float,
     provider_signature: dict,
 ) -> str:
     """生成试听缓存指纹，任一配音参数变化后自动让旧试听结果失效。"""
@@ -6637,6 +6676,7 @@ def _voice_preview_fingerprint(
         "voice_name": voice_name,
         "voice_rate": voice_rate,
         "voice_volume": voice_volume,
+        "voice_pitch": voice_pitch,
         "provider_signature": provider_signature,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -6721,6 +6761,7 @@ def _synthesize_voice_preview(
     voice_name: str,
     voice_rate: float,
     voice_volume: float,
+    voice_pitch: float,
 ) -> dict | None:
     """生成一次试听并转为内存缓存，临时文件不会跨会话长期保留。"""
     if selected_tts_server == "chatterbox":
@@ -6733,7 +6774,7 @@ def _synthesize_voice_preview(
     logger.info(
         f"generating {preview_type} voice preview: "
         f"voice={voice_name}, rate={voice_rate}, volume={voice_volume}, "
-        f"text_length={len(content)}"
+        f"pitch={voice_pitch}, text_length={len(content)}"
     )
     try:
         with config.try_runtime_config_lock() as lock_acquired:
@@ -6745,6 +6786,7 @@ def _synthesize_voice_preview(
                 voice_rate=voice_rate,
                 voice_file=audio_file,
                 voice_volume=voice_volume,
+                voice_pitch=voice_pitch,
             )
         if not sub_maker or not os.path.exists(audio_file):
             logger.error(f"{preview_type} voice preview did not produce an audio file")
@@ -6797,6 +6839,7 @@ def _synthesize_voice_preview(
             "tts_server": selected_tts_server,
             "voice_name": voice_name,
             "voice_rate": float(voice_rate),
+            "voice_pitch": float(voice_pitch),
         }
     finally:
         # 浏览器播放器使用内存字节，文件读取完即可清理，避免频繁试听积累临时文件。
@@ -6866,6 +6909,7 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
         voice_name=voice_name,
         voice_rate=params.voice_rate,
         voice_volume=params.voice_volume,
+        voice_pitch=params.voice_pitch,
         provider_signature=provider_signature,
     )
     full_fingerprint = (
@@ -6876,6 +6920,7 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
             voice_name=voice_name,
             voice_rate=params.voice_rate,
             voice_volume=params.voice_volume,
+            voice_pitch=params.voice_pitch,
             provider_signature=provider_signature,
         )
         if script_content
@@ -6900,6 +6945,7 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
                         voice_name=voice_name,
                         voice_rate=params.voice_rate,
                         voice_volume=params.voice_volume,
+                        voice_pitch=params.voice_pitch,
                     )
             except Exception as exc:
                 logger.exception(f"failed to generate {preview_type} voice preview")
@@ -7438,18 +7484,17 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
                                                         response_generator=lambda prompt: llm._generate_response(
                                                             prompt=prompt,
                                                             app_config=app_config_snapshot,
+                                                            json_mode=True,
                                                         ),
                                                     )
                                                 ),
                                             )
-                                    except Exception as exc:
+                                    except Exception:
                                         logger.exception(
                                             "AI visual shot planning failed"
                                         )
                                         st.warning(
-                                            tr(
-                                                "Visual Shot Planning Failed"
-                                            ).format(error=str(exc))
+                                            tr("Visual Shot Planning Failed")
                                         )
                                     else:
                                         visual_plan_data = (
@@ -7735,6 +7780,7 @@ def _get_reusable_full_voice_preview(params, voice_mode: str) -> dict | None:
         voice_name=params.voice_name,
         voice_rate=params.voice_rate,
         voice_volume=params.voice_volume,
+        voice_pitch=params.voice_pitch,
         provider_signature=_get_voice_preview_provider_signature(selected_tts_server),
     )
     cached_preview = st.session_state.get("voice_preview_audio")
@@ -7764,6 +7810,7 @@ def _get_reusable_full_voice_preview(params, voice_mode: str) -> dict | None:
         "voice_name": params.voice_name,
         "voice_rate": float(params.voice_rate),
         "voice_volume": float(params.voice_volume),
+        "voice_pitch": float(params.voice_pitch),
     }
 
 
@@ -8821,6 +8868,7 @@ def _render_audio_settings(panel, params):
             )
             params.voice_volume = 1.0
             params.voice_rate = 1.0
+            params.voice_pitch = 0.0
             uploaded_audio_file = None
             voice_volume_options = [0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0, 4.0, 5.0]
             voice_rate_options = [0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5, 1.8, 2.0]
@@ -8861,6 +8909,40 @@ def _render_audio_settings(panel, params):
                     )
                 _set_runtime_config("ui", "voice_volume", params.voice_volume)
                 _set_runtime_config("ui", "voice_rate", params.voice_rate)
+
+                if selected_tts_server == "azure-tts-v1":
+                    pitch_widget_key = localized_widget_key("voice_pitch_slider")
+
+                    if pitch_widget_key not in st.session_state:
+                        saved_pitch = _saved_ui_number(
+                            "voice_pitch",
+                            0,
+                            -50,
+                            50,
+                            number_type=int,
+                        )
+                        saved_pitch = int(round(float(saved_pitch) / 5.0) * 5)
+                        st.session_state[pitch_widget_key] = max(
+                            -50,
+                            min(50, saved_pitch),
+                        )
+
+                    params.voice_pitch = st.slider(
+                        tr("Voiceover Pitch"),
+                        min_value=-50,
+                        max_value=50,
+                        step=5,
+                        key=pitch_widget_key,
+                        format="%d Hz",
+                        help=tr("Voiceover Pitch Help"),
+                    )
+                    _set_runtime_config(
+                        "ui",
+                        "voice_pitch",
+                        params.voice_pitch,
+                    )
+                    st.caption(tr("Voiceover Pitch Scale"))
+
 
                 # 试听必须位于音量和语速控件之后，确保调用使用当前控件值。
                 _render_voice_preview(
