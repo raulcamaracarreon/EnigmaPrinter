@@ -234,6 +234,9 @@ def _build_timeline(
     segment_matches: list[list[tuple[_ScriptToken, RecognizedWord]]] = [
         [] for _ in segments
     ]
+    segment_token_counts = [0 for _ in segments]
+    for token in script_tokens:
+        segment_token_counts[token.segment_index] += 1
     alignment_units: list[narration_timeline.NarrationAlignmentUnit] = []
 
     for script_index, token in enumerate(script_tokens):
@@ -256,9 +259,12 @@ def _build_timeline(
     for segment_index, (segment_text, matches) in enumerate(
         zip(segments, segment_matches), start=1
     ):
-        if not matches:
+        token_count = segment_token_counts[segment_index - 1]
+        segment_coverage = len(matches) / token_count if token_count else 0.0
+        if not matches or segment_coverage < 0.60:
             raise NarrationAlignmentError(
-                f"script segment {segment_index} could not be aligned to the uploaded audio"
+                f"script segment {segment_index} could not be aligned reliably "
+                f"(segment coverage {segment_coverage:.0%}, required 60%)"
             )
         start = max(0.0, min(matches[0][1].start, audio_duration))
         end = max(start, min(matches[-1][1].end, audio_duration))

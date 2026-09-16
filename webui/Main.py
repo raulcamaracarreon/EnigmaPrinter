@@ -7715,8 +7715,8 @@ def _matching_applied_media_shot_timeline(
 
     if not narration_preview:
         raise timeline_media.TimelineMediaError(
-            "the applied Visual Shot Plan requires the matching Full Audio preview; "
-            "generate Full Audio again before starting timeline-aware generation"
+            "the applied Visual Shot Plan requires matching narration timing; "
+            "analyze or generate the current voiceover again before timeline-aware generation"
         )
 
     applied_voice_fingerprint = str(
@@ -7732,8 +7732,8 @@ def _matching_applied_media_shot_timeline(
         or current_voice_fingerprint != applied_voice_fingerprint
     ):
         raise timeline_media.TimelineMediaError(
-            "the applied Visual Shot Plan belongs to a different voiceover preview; "
-            "regenerate the Visual Shot Plan after the current Full Audio"
+            "the applied Visual Shot Plan belongs to different narration timing; "
+            "regenerate the Visual Shot Plan after the current voiceover"
         )
 
     duration = narration_preview.get("duration")
