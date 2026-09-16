@@ -117,7 +117,7 @@ class TestNarrationAlignment(unittest.TestCase):
 
         with self.assertRaisesRegex(
             narration_alignment.NarrationAlignmentError,
-            "script segment 2 could not be aligned",
+            r"script segment 2 could not be aligned reliably .*segment coverage 50%, required 60%",
         ):
             narration_alignment.align_external_narration(
                 audio_file="unused.wav",
