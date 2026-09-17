@@ -7399,7 +7399,7 @@ def _render_audio_first_timeline_plan(params, cached_preview):
                 # The Active Shot Plan is the only timing plan handed to the visual layer.
                 # Generating visual prompts also applies them immediately, removing the former
                 # "Generate Visual Shot Plan" -> table -> "Use as Visual Prompts" ceremony.
-                if _uses_ai_visual_prompts(params.video_source):
+                if active_shot_data:
                     visual_plan_fingerprint_payload = {
                         "shot_plan": active_shot_data,
                         "video_subject": str(
