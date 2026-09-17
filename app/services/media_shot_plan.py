@@ -22,6 +22,9 @@ _SOURCE_PRIORITY = {
     BOUNDARY_ALIGNMENT: 2,
     BOUNDARY_BALANCED: 3,
 }
+_STRONG_SENTENCE_END_RE = re.compile(
+    r'[.?!…][\]\)}»”’"\']*\s*$'
+)
 
 
 @dataclass(frozen=True)
@@ -246,7 +249,7 @@ def _shot_text_and_indices(
     alignment_text, alignment_indices = _overlapping_spans(
         list(scene.get("alignment_spans", []) or []), start, end
     )
-    text = alignment_text or narration_text
+    text = narration_text or alignment_text
     if not text:
         text = str(scene.get("narration_text", "") or "").strip()
     return text, narration_indices, alignment_indices
@@ -531,6 +534,22 @@ def build_media_shot_plan(
     preferred_scene_cuts = preferred_scene_cuts or {}
     base_shots: list[MediaShot] = []
     locked_boundaries: list[float] = []
+
+    # A strong sentence ending is a hard visual cut.
+    # The minimum shot duration must never merge across it.
+    for scene in scenes[:-1]:
+        if not isinstance(scene, dict):
+            continue
+
+        narration_text = str(
+            scene.get("narration_text", "") or ""
+        ).strip()
+
+        if _STRONG_SENTENCE_END_RE.search(narration_text):
+            locked_boundaries.append(
+                _safe_float(scene.get("end"), 0.0)
+            )
+
     for scene_position, raw_scene in enumerate(scenes, start=1):
         if not isinstance(raw_scene, dict):
             continue
