@@ -3140,19 +3140,108 @@ def _get_audio_duration_from_submaker(sub_maker: SubMaker):
 
 def _get_audio_duration_from_file(audio_file: str) -> float:
     """
-    获取音频文件时长（支持 mp3/m4a/wav/aac 等 ffmpeg 可解码的格式）
+    Get audio duration for any FFmpeg-supported format.
+
+    Prefer ffprobe because MoviePy's FFmpeg probing can fail with newer
+    FFmpeg versions even when the media file itself is perfectly valid.
     """
     if not os.path.exists(audio_file):
         logger.error(f"audio file does not exist: {audio_file}")
         return 0.0
 
+    # Preferred path: ffprobe next to the configured ffmpeg binary.
+    ffmpeg_binary = utils.get_ffmpeg_binary()
+
+    ffprobe_candidates = []
+
+    if ffmpeg_binary:
+        ffprobe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+        ffprobe_candidates.append(
+            os.path.join(os.path.dirname(ffmpeg_binary), ffprobe_name)
+        )
+
+    system_ffprobe = shutil.which("ffprobe")
+    if system_ffprobe:
+        ffprobe_candidates.append(system_ffprobe)
+
+    for ffprobe_binary in dict.fromkeys(ffprobe_candidates):
+        if not ffprobe_binary or not os.path.isfile(ffprobe_binary):
+            continue
+
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe_binary,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    audio_file,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+            )
+
+            if result.returncode == 0:
+                duration = float(result.stdout.strip())
+                if math.isfinite(duration) and duration > 0:
+                    return duration
+
+        except Exception as exc:
+            logger.warning(f"ffprobe duration lookup failed: {exc}")
+
+    # Secondary fallback: FFmpeg itself prints Duration in its input banner.
+    if ffmpeg_binary and os.path.isfile(ffmpeg_binary):
+        try:
+            result = subprocess.run(
+                [
+                    ffmpeg_binary,
+                    "-hide_banner",
+                    "-i",
+                    audio_file,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+            )
+
+            match = re.search(
+                r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)",
+                result.stderr or "",
+            )
+
+            if match:
+                hours = int(match.group(1))
+                minutes = int(match.group(2))
+                seconds = float(match.group(3))
+
+                duration = hours * 3600 + minutes * 60 + seconds
+
+                if math.isfinite(duration) and duration > 0:
+                    return duration
+
+        except Exception as exc:
+            logger.warning(f"ffmpeg duration lookup failed: {exc}")
+
+    # Last compatibility fallback for environments where ffprobe is absent.
     try:
-        # Use moviepy (ffmpeg) to read the duration of any supported audio format
         with AudioFileClip(audio_file) as audio:
-            return audio.duration  # Duration in seconds
-    except Exception as e:
-        logger.error(f"Failed to get audio duration from file: {str(e)}")
-        return 0.0
+            duration = float(audio.duration)
+            if math.isfinite(duration) and duration > 0:
+                return duration
+    except Exception as exc:
+        logger.error(f"Failed to get audio duration from file: {exc}")
+
+    return 0.0
 
 def get_audio_duration(target: Union[str, SubMaker]) -> float:
     """

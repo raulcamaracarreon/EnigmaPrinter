@@ -235,7 +235,7 @@ class TestVideoService(unittest.TestCase):
         ):
             result = vd.generate_video(
                 video_path="combined.mp4",
-                audio_path="voice.mp3",
+                audio_path="voice.wav",
                 subtitle_path="",
                 output_file="final.mp4",
                 params=params,
@@ -278,7 +278,7 @@ class TestVideoService(unittest.TestCase):
         ):
             result = vd.generate_video(
                 video_path="combined.mp4",
-                audio_path="voice.mp3",
+                audio_path="voice.wav",
                 subtitle_path="",
                 output_file="final.mp4",
                 params=params,
@@ -335,7 +335,7 @@ class TestVideoService(unittest.TestCase):
                 ):
                     result = vd.generate_video(
                         video_path="combined.mp4",
-                        audio_path="voice.mp3",
+                        audio_path="voice.wav",
                         subtitle_path="",
                         output_file="final.mp4",
                         params=params,
@@ -343,7 +343,7 @@ class TestVideoService(unittest.TestCase):
                     )
 
                 self.assertTrue(result)
-                audio_file_clip.assert_called_once_with("voice.mp3")
+                audio_file_clip.assert_called_once_with("voice.wav")
                 get_bgm_file.assert_not_called()
                 composite_audio.assert_not_called()
                 writer.assert_called_once()
@@ -396,7 +396,7 @@ class TestVideoService(unittest.TestCase):
                 ):
                     result = vd.generate_video(
                         video_path="combined.mp4",
-                        audio_path="voice.mp3",
+                        audio_path="voice.wav",
                         subtitle_path="",
                         output_file="final.mp4",
                         params=params,
@@ -734,66 +734,41 @@ class TestVideoService(unittest.TestCase):
             finally:
                 vd.close_clip(clip)
 
-    def test_combine_videos_closes_audio_clip_when_duration_read_fails(self):
+    def test_combine_videos_uses_supplied_audio_duration(self):
         """
-        `combine_videos()` 只需要读取旁白音频时长。即使读取 duration
-        时发生异常，也必须关闭 AudioFileClip，避免文件句柄泄漏。
+        `combine_videos()` receives the already validated narration duration from
+        the task pipeline and must not reopen the audio file just to probe it.
         """
+        with patch.object(vd, "AudioFileClip") as audio_clip_mock:
+            result = vd.combine_videos(
+                combined_video_path="/tmp/unused-combined.mp4",
+                video_paths=[],
+                audio_file="/tmp/unused-audio.mp3",
+                audio_duration=10.0,
+            )
 
-        class _FakeAudioReader:
-            def __init__(self):
-                self.closed = False
-
-            def close(self):
-                self.closed = True
-
-        class _BrokenAudioClip:
-            def __init__(self):
-                self.reader = _FakeAudioReader()
-
-            @property
-            def duration(self):
-                raise RuntimeError("failed to read duration")
-
-        fake_audio_clip = _BrokenAudioClip()
-
-        with patch.object(vd, "AudioFileClip", return_value=fake_audio_clip):
-            with self.assertRaises(RuntimeError):
-                vd.combine_videos(
-                    combined_video_path="/tmp/unused-combined.mp4",
-                    video_paths=[],
-                    audio_file="/tmp/unused-audio.mp3",
-                )
-
-        self.assertTrue(fake_audio_clip.reader.closed)
+        self.assertEqual(result, "/tmp/unused-combined.mp4")
+        audio_clip_mock.assert_not_called()
 
     def test_combine_videos_handles_none_transition_mode(self):
         """
         Ensure `combine_videos` safely handles
         `video_transition_mode=None`.
         """
-        class _FakeAudioClip:
-            @property
-            def duration(self):
-                return 10.0
-
-            def close(self):
-                pass
-
         with tempfile.TemporaryDirectory() as temp_dir:
             combined_video_path = os.path.join(temp_dir, "combined.mp4")
             audio_file = os.path.join(temp_dir, "audio.mp3")
 
-            with patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()):
-                # Use empty video_paths to avoid heavy video processing while
-                # still exercising transition mode normalization logic.
-                result = vd.combine_videos(
-                    combined_video_path=combined_video_path,
-                    video_paths=[],
-                    audio_file=audio_file,
-                    video_transition_mode=None,
-                )
-                self.assertEqual(result, combined_video_path)
+            # Use empty video_paths to avoid heavy video processing while
+            # still exercising transition mode normalization logic.
+            result = vd.combine_videos(
+                combined_video_path=combined_video_path,
+                video_paths=[],
+                audio_file=audio_file,
+                audio_duration=10.0,
+                video_transition_mode=None,
+            )
+            self.assertEqual(result, combined_video_path)
 
     def _capture_source_ranges_for_clip_speed(
         self,
@@ -869,6 +844,7 @@ class TestVideoService(unittest.TestCase):
                     combined_video_path=combined_video_path,
                     video_paths=["clip.mp4"],
                     audio_file="audio.mp3",
+                    audio_duration=audio_duration,
                     video_concat_mode=vd.VideoConcatMode.random,
                     max_clip_duration=max_clip_duration,
                     clip_speed=clip_speed,
@@ -951,6 +927,7 @@ class TestVideoService(unittest.TestCase):
                                     combined_video_path=combined_video_path,
                                     video_paths=list(video_durations.keys()),
                                     audio_file=os.path.join(temp_dir, "audio.mp3"),
+                                    audio_duration=10.0,
                                     video_aspect=vd.VideoAspect.portrait,
                                     video_concat_mode=vd.VideoConcatMode.sequential,
                                     video_transition_mode=None,

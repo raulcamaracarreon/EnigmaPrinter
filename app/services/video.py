@@ -787,6 +787,7 @@ def combine_videos_with_timeline(
     video_paths: List[str],
     audio_file: str,
     shot_timeline,
+    audio_duration: float,
     video_aspect: VideoAspect = VideoAspect.portrait,
     video_transition_mode: VideoTransitionMode = None,
     max_clip_duration: float = 5,
@@ -802,11 +803,7 @@ def combine_videos_with_timeline(
     locked narrative timeline. Here every source path maps 1:1 to one validated shot
     and no extra clip is inserted.
     """
-    audio_clip = AudioFileClip(audio_file)
-    try:
-        real_audio_duration = float(audio_clip.duration)
-    finally:
-        close_clip(audio_clip)
+    real_audio_duration = float(audio_duration)
 
     shots = timeline_media.normalize_locked_shot_timeline(
         shot_timeline,
@@ -924,6 +921,7 @@ def combine_videos(
     combined_video_path: str,
     video_paths: List[str],
     audio_file: str,
+    audio_duration: float,
     video_aspect: VideoAspect = VideoAspect.portrait,
     video_concat_mode: VideoConcatMode = VideoConcatMode.random,
     video_transition_mode: VideoTransitionMode = None,
@@ -935,13 +933,7 @@ def combine_videos(
     source_groups: dict[str, str] | None = None,
     used_video_paths: List[str] | None = None,
 ) -> str:
-    audio_clip = AudioFileClip(audio_file)
-    try:
-        # 这里只需要读取旁白音频时长来决定素材视频拼接长度；后续不会再使用
-        # audio_clip。读取完成后立即关闭，避免早退或异常路径泄漏文件句柄。
-        audio_duration = audio_clip.duration
-    finally:
-        close_clip(audio_clip)
+    audio_duration = float(audio_duration)
     logger.info(f"audio duration: {audio_duration} seconds")
     logger.info(f"maximum clip duration: {max_clip_duration} seconds")
     required_video_duration = _get_required_video_duration(audio_duration)
@@ -1602,14 +1594,69 @@ def generate_video(
             _clip = _clip.with_position(("center", "center"))
         return _clip
 
+    # MoviePy/FFmpeg 7 can fail while probing compressed narration formats such
+    # as MP3 even though FFmpeg itself can decode them correctly. Normalize the
+    # narration to a temporary PCM WAV before MoviePy opens it. The original
+    # uploaded file remains untouched and the temporary file is removed after
+    # every MoviePy reader has been closed.
+    normalized_audio_path = audio_path
+    normalized_audio_temp_path = ""
+
+    if os.path.splitext(audio_path)[1].lower() != ".wav":
+        temp_dir = output_dir if output_dir and os.path.isdir(output_dir) else None
+        temp_fd, normalized_audio_temp_path = tempfile.mkstemp(
+            prefix="normalized-narration-",
+            suffix=".wav",
+            dir=temp_dir,
+        )
+        os.close(temp_fd)
+
+        ffmpeg_binary = get_ffmpeg_binary()
+        normalize_result = subprocess.run(
+            [
+                ffmpeg_binary,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                audio_path,
+                "-vn",
+                "-c:a",
+                "pcm_s16le",
+                normalized_audio_temp_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        if normalize_result.returncode != 0:
+            delete_files(normalized_audio_temp_path)
+            raise RuntimeError(
+                "failed to normalize narration audio for MoviePy: "
+                f"{normalize_result.stderr.strip()}"
+            )
+
+        normalized_audio_path = normalized_audio_temp_path
+        logger.info(
+            "normalized narration audio for final composition: "
+            f"{audio_path} -> {normalized_audio_path}"
+        )
+
     # MoviePy 的 CompositeAudioClip.close() 不会关闭子 AudioFileClip。这里用
     # ExitStack 显式持有所有原始文件 reader，确保成功、字幕异常、混音失败和
     # 视频写入失败等路径都能释放 FFmpeg 子进程，尤其避免 Windows 文件被占用。
     with ExitStack() as clip_stack:
+        if normalized_audio_temp_path:
+            clip_stack.callback(delete_files, normalized_audio_temp_path)
+
         source_video_clip = clip_stack.enter_context(
             _open_video_clip_quietly(video_path)
         )
-        voice_source_clip = clip_stack.enter_context(AudioFileClip(audio_path))
+        voice_source_clip = clip_stack.enter_context(
+            AudioFileClip(normalized_audio_path)
+        )
         video_clip = source_video_clip
         audio_clip = voice_source_clip.with_effects(
             [afx.MultiplyVolume(params.voice_volume)]
