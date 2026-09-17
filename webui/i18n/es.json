@@ -421,6 +421,11 @@
     "OFox Vendor Auto": "Auto (balanceo de la pasarela)",
     "Voiceover Pitch": "Tono de voz (Edge TTS)",
     "Voiceover Pitch Help": "Solo para Edge TTS. Los valores negativos hacen la voz más grave y los positivos la hacen más aguda. 0 Hz conserva el tono original.",
-    "Voiceover Pitch Scale": "Más grave ← 0 Hz → Más agudo"
+    "Voiceover Pitch Scale": "Más grave ← 0 Hz → Más agudo",
+    "Analyze Uploaded Narration": "Analizar narración cargada",
+    "Analyze Uploaded Narration Help": "Alinea la narración cargada con el guion actual y construye el mismo Timeline de narración, Timeline semántico de escenas y Active Shot Plan del TTS interno.",
+    "Analyzing Uploaded Narration": "Analizando narración cargada",
+    "Uploaded Narration Alignment Failed": "No se pudo alinear la narración cargada: {error}",
+    "Uploaded Narration Alignment Summary": "Narración cargada alineada: {matched}/{script} palabras del guion coinciden ({coverage:.0%}); {recognized_coverage:.0%} del habla reconocida pertenece al guion."
   }
 }

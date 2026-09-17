@@ -2689,11 +2689,42 @@ def _prepare_comfyui_video_workflow(
                     )
                     break
 
-    # Video models often require model-specific dimensions (for example 1280x736
-    # instead of generic 1280x720). Preserve the exported workflow by default and
-    # only inject MoneyPrinterTurbo's aspect-based size when the user opts in.
+    # Preserve the workflow's native resolution graph whenever it exposes a
+    # ResolutionSelector. EnigmaPrinter controls only the requested orientation;
+    # the workflow keeps its own megapixel budget, rounding multiple, and
+    # downstream width/height calculations.
+    if height > width:
+        selected_aspect_ratio = "9:16 (Portrait Widescreen)"
+    elif width > height:
+        selected_aspect_ratio = "16:9 (Widescreen)"
+    else:
+        selected_aspect_ratio = "1:1 (Square)"
+
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("class_type") or "") != "ResolutionSelector":
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict) or "aspect_ratio" not in inputs:
+            continue
+
+        old_aspect_ratio = inputs.get("aspect_ratio")
+        inputs["aspect_ratio"] = selected_aspect_ratio
+        size_updated = True
+        logger.info(
+            "ComfyUI Video aspect-ratio injection: "
+            f"node={node_id}, old={old_aspect_ratio!r}, "
+            f"new={selected_aspect_ratio!r}"
+        )
+        break
+
+    # Fallback for simpler workflows that expose literal width/height values
+    # directly instead of a ResolutionSelector. Unlike ResolutionSelector-based
+    # workflows, literal dimensions are overridden only when the user explicitly
+    # enables the advanced resolution override option.
     override_resolution = is_comfyui_video_resolution_override_enabled()
-    if override_resolution:
+    if not size_updated and override_resolution:
         preferred_size_nodes = []
         for node in workflow.values():
             if not isinstance(node, dict):
@@ -2701,7 +2732,14 @@ def _prepare_comfyui_video_workflow(
             inputs = node.get("inputs")
             if not isinstance(inputs, dict):
                 continue
-            if "width" not in inputs or "height" not in inputs:
+            old_width = inputs.get("width")
+            old_height = inputs.get("height")
+            if (
+                not isinstance(old_width, (int, float))
+                or isinstance(old_width, bool)
+                or not isinstance(old_height, (int, float))
+                or isinstance(old_height, bool)
+            ):
                 continue
             label = _comfyui_node_label(node)
             if any(
@@ -2720,11 +2758,19 @@ def _prepare_comfyui_video_workflow(
                 )
             ):
                 preferred_size_nodes.append(inputs)
+
         size_inputs = preferred_size_nodes[0] if preferred_size_nodes else None
         if size_inputs is not None:
+            old_width = size_inputs["width"]
+            old_height = size_inputs["height"]
             size_inputs["width"] = int(width)
             size_inputs["height"] = int(height)
             size_updated = True
+            logger.info(
+                "ComfyUI Video literal resolution injection: "
+                f"workflow={old_width}x{old_height}, "
+                f"selected={int(width)}x{int(height)}"
+            )
 
     # Randomize literal sampling seeds. Multi-stage video workflows may contain
     # more than one RandomNoise node (for example base generation + refinement),
@@ -2884,12 +2930,14 @@ def _prepare_comfyui_video_workflow(
     if override_resolution and not size_updated:
         logger.warning(
             "ComfyUI Video resolution override is enabled but no compatible "
-            "width/height input was detected; the workflow's own resolution will be used."
+            "literal width/height input was detected; the workflow's own "
+            "resolution will be used."
         )
-    elif not override_resolution:
+    elif not size_updated:
         logger.debug(
-            "ComfyUI Video keeps the workflow-defined resolution; final composition "
-            "will resize/crop it to the selected MoneyPrinterTurbo aspect ratio."
+            "ComfyUI Video keeps the workflow-defined resolution because no "
+            "ResolutionSelector was detected and literal resolution override "
+            "is disabled."
         )
     if not seed_updated:
         logger.debug(

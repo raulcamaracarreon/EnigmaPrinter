@@ -774,14 +774,21 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         return ""
 
     if sub_maker is None and subtitle_provider != "whisper":
-        # 自定义音频不会经过 TTS，因此没有 Edge/Azure 等 TTS 返回的
-        # sub_maker 时间轴。只有 Whisper 可以直接从音频文件转写字幕；
-        # 其他字幕提供方继续保持原有行为，避免生成错误的空时间轴。
-        logger.warning(
-            "subtitle maker is missing, skip subtitle generation for provider: "
-            f"{subtitle_provider}"
-        )
-        return ""
+        # Uploaded narration has no TTS SubMaker. Its audio is still the temporal
+        # authority, so generate subtitle timing directly from that audio with
+        # faster-whisper and correct the recognized text against the canonical script.
+        if getattr(params, "custom_audio_file", None) and audio_file:
+            logger.info(
+                "subtitle maker is missing for uploaded narration; "
+                "using whisper timing from the external audio"
+            )
+            subtitle_provider = "whisper"
+        else:
+            logger.warning(
+                "subtitle maker is missing, skip subtitle generation for provider: "
+                f"{subtitle_provider}"
+            )
+            return ""
 
     is_word_level = getattr(params, "subtitle_display_mode", "sentence") == "word_by_word"
 
@@ -1182,6 +1189,7 @@ def generate_final_videos(
                 video_paths=downloaded_videos,
                 audio_file=audio_file,
                 shot_timeline=locked_timeline,
+                audio_duration=audio_duration,
                 video_aspect=params.video_aspect,
                 video_fit_mode=params.video_fit_mode,
                 video_transition_mode=video_transition_mode,
@@ -1194,6 +1202,7 @@ def generate_final_videos(
                 combined_video_path=combined_video_path,
                 video_paths=downloaded_videos,
                 audio_file=audio_file,
+                audio_duration=audio_duration,
                 video_aspect=params.video_aspect,
                 video_fit_mode=params.video_fit_mode,
                 video_concat_mode=video_concat_mode,

@@ -50,6 +50,7 @@ from app.services import (
     loomloom,
     material,
     metaso_minimax,
+    narration_alignment,
     narration_timeline,
     visual_timeline,
     media_shot_plan,
@@ -457,6 +458,840 @@ def _saved_ui_choice(key, options, default):
             if converted == option:
                 return option
     return default
+
+
+VISUAL_STYLE_MANUAL = "manual"
+
+VISUAL_STYLE_PRESET_LABELS = {
+    VISUAL_STYLE_MANUAL: "Custom / Manual",
+    "cinematic_realism": "Cinematic Realism",
+    "photorealistic": "Photorealistic",
+    "cinematic_graphic_novel": "Cinematic Graphic Novel",
+    "noir_graphic_novel": "Noir Graphic Novel",
+    "anime": "Anime",
+    "chibi": "Chibi",
+    "three_d_animated_film": "3D Animated Film",
+    "three_d_realistic_render": "3D Realistic Render",
+    "digital_painting": "Digital Painting",
+    "oil_painting": "Oil Painting",
+    "watercolor": "Watercolor",
+    "pencil_sketch": "Pencil Sketch",
+    "charcoal_drawing": "Charcoal Drawing",
+    "ink_illustration": "Ink Illustration",
+    "childrens_book": "Children's Book",
+    "retro_pulp": "Retro Pulp",
+    "fantasy_storybook": "Fantasy Storybook",
+    "pixel_art": "Pixel Art",
+}
+
+VISUAL_STYLE_PRESETS = {
+    "openai_image": {
+        VISUAL_STYLE_MANUAL: {
+            "positive": "",
+            "negative": "",
+        },
+        "cinematic_realism": {
+            "positive": (
+                "{term}. Cinematic realism, grounded live-action visual language, "
+                "natural skin and materials, dramatic but plausible lighting, "
+                "sophisticated composition, realistic color grading, high detail."
+            ),
+            "negative": "",
+        },
+        "photorealistic": {
+            "positive": (
+                "{term}. Photorealistic still image, true-to-life proportions, "
+                "physically plausible lighting, natural textures and materials, "
+                "realistic lens behavior, documentary-level detail."
+            ),
+            "negative": "",
+        },
+        "cinematic_graphic_novel": {
+            "positive": (
+                "{term}. Modern graphic novel illustration, European graphic novel "
+                "aesthetic, mature semi-realistic character design, expressive ink "
+                "linework, painted shadows, cinematic framing, sophisticated color palette."
+            ),
+            "negative": "",
+        },
+        "noir_graphic_novel": {
+            "positive": (
+                "{term}. Noir graphic novel illustration, mature European comic "
+                "aesthetic, high-contrast chiaroscuro, expressive ink linework, "
+                "restrained palette, moody cinematic composition, suspenseful atmosphere."
+            ),
+            "negative": "",
+        },
+        "anime": {
+            "positive": (
+                "{term}. High-quality cinematic anime illustration, expressive "
+                "linework, refined cel shading, detailed background art, coherent "
+                "character design, dramatic composition."
+            ),
+            "negative": "",
+        },
+        "chibi": {
+            "positive": (
+                "{term}. Polished chibi illustration, super-deformed proportions, "
+                "oversized expressive head, compact body, clean linework, soft cel "
+                "shading, cohesive character design, detailed environment."
+            ),
+            "negative": "",
+        },
+        "three_d_animated_film": {
+            "positive": (
+                "{term}. High-end 3D animated film aesthetic, expressive stylized "
+                "characters, polished cinematic lighting, detailed modeled environments, "
+                "appealing materials, strong silhouette design, feature-animation quality."
+            ),
+            "negative": "",
+        },
+        "three_d_realistic_render": {
+            "positive": (
+                "{term}. High-end realistic 3D render, physically based materials, "
+                "global illumination, realistic reflections, detailed geometry, "
+                "cinematic lighting, sophisticated camera composition."
+            ),
+            "negative": "",
+        },
+        "digital_painting": {
+            "positive": (
+                "{term}. Refined digital painting, painterly brushwork, rich color "
+                "transitions, atmospheric depth, dramatic lighting, detailed forms, "
+                "cinematic composition, professional concept-art finish."
+            ),
+            "negative": "",
+        },
+        "oil_painting": {
+            "positive": (
+                "{term}. Traditional oil painting aesthetic, visible layered brushwork, "
+                "rich pigments, subtle impasto texture, deep tonal modeling, atmospheric "
+                "light, classical painterly composition."
+            ),
+            "negative": "",
+        },
+        "watercolor": {
+            "positive": (
+                "{term}. Expressive watercolor illustration, translucent pigment washes, "
+                "soft color bleeding, delicate layered tones, visible paper texture, "
+                "controlled loose edges, elegant atmospheric composition."
+            ),
+            "negative": "",
+        },
+        "pencil_sketch": {
+            "positive": (
+                "{term}. Detailed graphite pencil sketch, precise contour drawing, "
+                "natural cross-hatching, tonal shading, visible paper grain, confident "
+                "draftsmanship, refined monochrome illustration."
+            ),
+            "negative": "",
+        },
+        "charcoal_drawing": {
+            "positive": (
+                "{term}. Dramatic charcoal drawing, bold gestural marks, deep blacks, "
+                "smudged tonal gradients, textured paper, expressive contrast, "
+                "hand-drawn fine-art character."
+            ),
+            "negative": "",
+        },
+        "ink_illustration": {
+            "positive": (
+                "{term}. Detailed ink illustration, confident black linework, varied "
+                "line weight, controlled hatching, crisp silhouettes, handcrafted "
+                "editorial drawing aesthetic."
+            ),
+            "negative": "",
+        },
+        "childrens_book": {
+            "positive": (
+                "{term}. Warm children's book illustration, friendly stylized forms, "
+                "soft shapes, charming expressive characters, gentle color palette, "
+                "clear storytelling composition, polished hand-illustrated finish."
+            ),
+            "negative": "",
+        },
+        "retro_pulp": {
+            "positive": (
+                "{term}. Mid-century pulp magazine illustration, dramatic painted "
+                "lighting, bold composition, vintage print character, saturated colors, "
+                "expressive faces, adventurous cinematic staging."
+            ),
+            "negative": "",
+        },
+        "fantasy_storybook": {
+            "positive": (
+                "{term}. Lavish fantasy storybook illustration, painterly enchanted "
+                "atmosphere, intricate costumes and environments, luminous magical light, "
+                "rich color harmony, elegant narrative composition."
+            ),
+            "negative": "",
+        },
+        "pixel_art": {
+            "positive": (
+                "{term}. Detailed pixel art scene, deliberate pixel clusters, crisp "
+                "hard-edged forms, limited harmonious palette, readable silhouettes, "
+                "carefully rendered environment, polished retro game artwork."
+            ),
+            "negative": "",
+        },
+    },
+    "comfyui_t2i": {
+        VISUAL_STYLE_MANUAL: {
+            "positive": "",
+            "negative": "",
+        },
+        "cinematic_realism": {
+            "positive": (
+                "{term}\n"
+                "cinematic realism\n"
+                "grounded live-action visual language\n"
+                "natural skin and realistic materials\n"
+                "dramatic but plausible lighting\n"
+                "cinematic composition\n"
+                "realistic color grading\n"
+                "high detail"
+            ),
+            "negative": (
+                "anime, manga, chibi, cartoon, 3d render, plastic skin, "
+                "distorted anatomy, extra limbs, extra fingers, bad hands, "
+                "deformed face, blurry, low detail"
+            ),
+        },
+        "photorealistic": {
+            "positive": (
+                "{term}\n"
+                "photorealistic still image\n"
+                "true-to-life proportions\n"
+                "physically plausible lighting\n"
+                "natural textures and materials\n"
+                "realistic lens behavior\n"
+                "documentary-level detail"
+            ),
+            "negative": (
+                "anime, manga, chibi, cartoon, illustration, 3d render, "
+                "plastic skin, distorted anatomy, extra limbs, extra fingers, "
+                "bad hands, deformed face, blurry, low detail"
+            ),
+        },
+        "cinematic_graphic_novel": {
+            "positive": (
+                "{term}\n"
+                "modern graphic novel illustration\n"
+                "European graphic novel aesthetic\n"
+                "mature semi-realistic character design\n"
+                "expressive ink linework\n"
+                "painted shadows\n"
+                "cinematic framing\n"
+                "sophisticated color palette"
+            ),
+            "negative": (
+                "anime, manga, chibi, photorealistic, 3d render, childish cartoon, "
+                "flat clipart, distorted anatomy, extra limbs, extra fingers, "
+                "bad hands, deformed face, blurry, low detail"
+            ),
+        },
+        "noir_graphic_novel": {
+            "positive": (
+                "{term}\n"
+                "noir graphic novel illustration\n"
+                "mature European comic aesthetic\n"
+                "high-contrast chiaroscuro\n"
+                "expressive ink linework\n"
+                "restrained color palette\n"
+                "moody cinematic composition\n"
+                "suspenseful atmosphere"
+            ),
+            "negative": (
+                "anime, manga, chibi, photorealistic, 3d render, childish cartoon, "
+                "flat clipart, distorted anatomy, extra limbs, extra fingers, "
+                "bad hands, blurry, low detail"
+            ),
+        },
+        "anime": {
+            "positive": (
+                "{term}\n"
+                "cinematic anime illustration\n"
+                "high quality anime scene\n"
+                "clean expressive linework\n"
+                "refined cel shading\n"
+                "detailed background art\n"
+                "coherent character design\n"
+                "dramatic composition"
+            ),
+            "negative": (
+                "photorealistic, live action, American superhero comic, chibi, "
+                "3d render, distorted anatomy, extra limbs, extra fingers, "
+                "bad hands, deformed face, blurry, low detail"
+            ),
+        },
+        "chibi": {
+            "positive": (
+                "{term}\n"
+                "polished chibi illustration\n"
+                "super-deformed proportions\n"
+                "oversized expressive head\n"
+                "compact body\n"
+                "clean linework\n"
+                "soft cel shading\n"
+                "cohesive character design"
+            ),
+            "negative": (
+                "photorealistic, live action, realistic body proportions, "
+                "3d render, grotesque anatomy, extra limbs, extra fingers, "
+                "malformed hands, blurry, low detail"
+            ),
+        },
+        "three_d_animated_film": {
+            "positive": (
+                "{term}\n"
+                "high-end 3d animated film aesthetic\n"
+                "expressive stylized characters\n"
+                "polished cinematic lighting\n"
+                "detailed modeled environments\n"
+                "appealing materials\n"
+                "strong silhouette design\n"
+                "feature-animation quality"
+            ),
+            "negative": (
+                "photorealistic live action, anime, manga, flat illustration, "
+                "cheap plastic look, low-poly artifacts, distorted anatomy, "
+                "extra limbs, bad hands, blurry, low detail"
+            ),
+        },
+        "three_d_realistic_render": {
+            "positive": (
+                "{term}\n"
+                "high-end realistic 3d render\n"
+                "physically based materials\n"
+                "global illumination\n"
+                "realistic reflections\n"
+                "detailed geometry\n"
+                "cinematic lighting\n"
+                "sophisticated camera composition"
+            ),
+            "negative": (
+                "anime, manga, chibi, flat cartoon, sketch, painterly brushwork, "
+                "cheap plastic materials, low-poly geometry, distorted anatomy, "
+                "extra limbs, bad hands, blurry, low detail"
+            ),
+        },
+        "digital_painting": {
+            "positive": (
+                "{term}\n"
+                "refined digital painting\n"
+                "painterly brushwork\n"
+                "rich color transitions\n"
+                "atmospheric depth\n"
+                "dramatic lighting\n"
+                "detailed forms\n"
+                "professional concept-art finish"
+            ),
+            "negative": (
+                "photorealistic photo, 3d render, anime, manga, chibi, flat clipart, "
+                "rough unfinished sketch, distorted anatomy, extra limbs, bad hands, "
+                "blurry, low detail"
+            ),
+        },
+        "oil_painting": {
+            "positive": (
+                "{term}\n"
+                "traditional oil painting aesthetic\n"
+                "visible layered brushwork\n"
+                "rich pigments\n"
+                "subtle impasto texture\n"
+                "deep tonal modeling\n"
+                "atmospheric light\n"
+                "classical painterly composition"
+            ),
+            "negative": (
+                "photorealistic photo, 3d render, anime, manga, chibi, vector art, "
+                "flat digital shading, distorted anatomy, extra limbs, bad hands, "
+                "blurry, low detail"
+            ),
+        },
+        "watercolor": {
+            "positive": (
+                "{term}\n"
+                "expressive watercolor illustration\n"
+                "translucent pigment washes\n"
+                "soft color bleeding\n"
+                "delicate layered tones\n"
+                "visible paper texture\n"
+                "controlled loose edges\n"
+                "elegant atmospheric composition"
+            ),
+            "negative": (
+                "photorealistic photo, 3d render, heavy opaque digital shading, "
+                "hard plastic surfaces, anime cel shading, vector art, muddy colors, "
+                "distorted anatomy, blurry, low detail"
+            ),
+        },
+        "pencil_sketch": {
+            "positive": (
+                "{term}\n"
+                "detailed graphite pencil sketch\n"
+                "precise contour drawing\n"
+                "natural cross-hatching\n"
+                "tonal shading\n"
+                "visible paper grain\n"
+                "confident draftsmanship\n"
+                "refined monochrome illustration"
+            ),
+            "negative": (
+                "full color painting, photorealistic photo, 3d render, anime cel shading, "
+                "vector art, marker rendering, distorted anatomy, extra limbs, "
+                "bad hands, blurry, low detail"
+            ),
+        },
+        "charcoal_drawing": {
+            "positive": (
+                "{term}\n"
+                "dramatic charcoal drawing\n"
+                "bold gestural marks\n"
+                "deep blacks\n"
+                "smudged tonal gradients\n"
+                "textured paper\n"
+                "expressive contrast\n"
+                "hand-drawn fine-art character"
+            ),
+            "negative": (
+                "full color painting, photorealistic photo, 3d render, clean vector art, "
+                "anime cel shading, glossy digital finish, distorted anatomy, "
+                "extra limbs, blurry, low detail"
+            ),
+        },
+        "ink_illustration": {
+            "positive": (
+                "{term}\n"
+                "detailed ink illustration\n"
+                "confident black linework\n"
+                "varied line weight\n"
+                "controlled hatching\n"
+                "crisp silhouettes\n"
+                "handcrafted editorial drawing aesthetic"
+            ),
+            "negative": (
+                "photorealistic photo, 3d render, soft airbrush rendering, "
+                "anime cel shading, painterly color wash, weak linework, "
+                "distorted anatomy, extra limbs, bad hands, blurry"
+            ),
+        },
+        "childrens_book": {
+            "positive": (
+                "{term}\n"
+                "warm children's book illustration\n"
+                "friendly stylized forms\n"
+                "soft shapes\n"
+                "charming expressive characters\n"
+                "gentle color palette\n"
+                "clear storytelling composition\n"
+                "polished hand-illustrated finish"
+            ),
+            "negative": (
+                "photorealistic, horror realism, gritty violence, grotesque anatomy, "
+                "hyper-detailed 3d render, harsh noir lighting, distorted anatomy, "
+                "extra limbs, frightening facial distortion"
+            ),
+        },
+        "retro_pulp": {
+            "positive": (
+                "{term}\n"
+                "mid-century pulp magazine illustration\n"
+                "dramatic painted lighting\n"
+                "bold composition\n"
+                "vintage print character\n"
+                "saturated colors\n"
+                "expressive faces\n"
+                "adventurous cinematic staging"
+            ),
+            "negative": (
+                "modern photorealistic photography, anime, manga, chibi, 3d render, "
+                "minimal flat vector art, sterile digital gradients, distorted anatomy, "
+                "extra limbs, blurry, low detail"
+            ),
+        },
+        "fantasy_storybook": {
+            "positive": (
+                "{term}\n"
+                "lavish fantasy storybook illustration\n"
+                "painterly enchanted atmosphere\n"
+                "intricate costumes and environments\n"
+                "luminous magical light\n"
+                "rich color harmony\n"
+                "elegant narrative composition"
+            ),
+            "negative": (
+                "photorealistic modern photography, industrial 3d render, flat clipart, "
+                "minimalist vector art, anime chibi proportions, distorted anatomy, "
+                "extra limbs, blurry, low detail"
+            ),
+        },
+        "pixel_art": {
+            "positive": (
+                "{term}\n"
+                "detailed pixel art scene\n"
+                "deliberate pixel clusters\n"
+                "crisp hard-edged forms\n"
+                "limited harmonious palette\n"
+                "readable silhouettes\n"
+                "carefully rendered environment\n"
+                "polished retro game artwork"
+            ),
+            "negative": (
+                "photorealistic, smooth vector gradients, painterly brushwork, "
+                "3d render, anti-aliased soft edges, blurry pixels, noisy dithering, "
+                "distorted anatomy, unreadable silhouettes"
+            ),
+        },
+    },
+    "comfyui_video": {
+        VISUAL_STYLE_MANUAL: {
+            "positive": "",
+            "negative": "",
+        },
+        "cinematic_realism": {
+            "positive": (
+                "{term}\n"
+                "cinematic realism\n"
+                "grounded live-action visual language\n"
+                "natural skin and realistic materials\n"
+                "dramatic but plausible lighting\n"
+                "cinematic camera movement\n"
+                "smooth natural motion\n"
+                "coherent character appearance across frames"
+            ),
+            "negative": (
+                "anime, manga, chibi, cartoon, 3d render, plastic skin, "
+                "distorted anatomy, extra limbs, bad hands, flicker, jitter, "
+                "warping, morphing, temporal inconsistency, blurry, low detail"
+            ),
+        },
+        "photorealistic": {
+            "positive": (
+                "{term}\n"
+                "photorealistic cinematic video\n"
+                "true-to-life proportions\n"
+                "physically plausible lighting\n"
+                "natural textures and materials\n"
+                "realistic camera behavior\n"
+                "smooth natural motion\n"
+                "stable temporal consistency"
+            ),
+            "negative": (
+                "anime, manga, chibi, cartoon, illustration, 3d render, "
+                "plastic skin, distorted anatomy, extra limbs, bad hands, "
+                "flicker, jitter, warping, morphing, temporal inconsistency, "
+                "blurry, low detail"
+            ),
+        },
+        "cinematic_graphic_novel": {
+            "positive": (
+                "{term}\n"
+                "animated modern graphic novel aesthetic\n"
+                "European graphic novel style\n"
+                "mature semi-realistic character design\n"
+                "expressive ink linework\n"
+                "painted shadows\n"
+                "cinematic framing\n"
+                "consistent linework across frames\n"
+                "controlled natural motion"
+            ),
+            "negative": (
+                "anime, manga, chibi, photorealistic, 3d render, childish cartoon, "
+                "flat clipart, distorted anatomy, extra limbs, bad hands, "
+                "flicker, jitter, linework instability, warping, morphing, "
+                "temporal inconsistency"
+            ),
+        },
+        "noir_graphic_novel": {
+            "positive": (
+                "{term}\n"
+                "animated noir graphic novel aesthetic\n"
+                "mature European comic style\n"
+                "high-contrast chiaroscuro\n"
+                "expressive ink linework\n"
+                "restrained palette\n"
+                "moody cinematic framing\n"
+                "stable illustrated character design\n"
+                "controlled natural motion"
+            ),
+            "negative": (
+                "anime, manga, chibi, photorealistic, 3d render, childish cartoon, "
+                "flat clipart, distorted anatomy, flicker, jitter, unstable linework, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "anime": {
+            "positive": (
+                "{term}\n"
+                "cinematic anime animation\n"
+                "clean expressive linework\n"
+                "refined cel shading\n"
+                "detailed anime background art\n"
+                "coherent character design\n"
+                "fluid natural motion\n"
+                "stable appearance across frames"
+            ),
+            "negative": (
+                "photorealistic, live action, American superhero comic, chibi, "
+                "3d render, distorted anatomy, extra limbs, bad hands, flicker, "
+                "jitter, warping, morphing, temporal inconsistency"
+            ),
+        },
+        "chibi": {
+            "positive": (
+                "{term}\n"
+                "polished chibi animation\n"
+                "super-deformed proportions\n"
+                "oversized expressive head\n"
+                "compact body\n"
+                "clean linework\n"
+                "soft cel shading\n"
+                "cohesive character design\n"
+                "smooth playful motion"
+            ),
+            "negative": (
+                "photorealistic, live action, realistic body proportions, "
+                "3d render, grotesque anatomy, extra limbs, malformed hands, "
+                "flicker, jitter, warping, morphing, temporal inconsistency"
+            ),
+        },
+        "three_d_animated_film": {
+            "positive": (
+                "{term}\n"
+                "high-end 3d animated film aesthetic\n"
+                "expressive stylized characters\n"
+                "polished cinematic lighting\n"
+                "detailed modeled environments\n"
+                "appealing materials\n"
+                "smooth feature-animation motion\n"
+                "stable character design across frames"
+            ),
+            "negative": (
+                "photorealistic live action, anime, manga, flat illustration, "
+                "cheap plastic look, low-poly artifacts, distorted anatomy, "
+                "flicker, jitter, warping, morphing, temporal inconsistency"
+            ),
+        },
+        "three_d_realistic_render": {
+            "positive": (
+                "{term}\n"
+                "realistic cinematic 3d animation\n"
+                "physically based materials\n"
+                "global illumination\n"
+                "realistic reflections\n"
+                "detailed geometry\n"
+                "natural cinematic camera motion\n"
+                "stable realistic surfaces across frames"
+            ),
+            "negative": (
+                "anime, manga, chibi, flat cartoon, painterly brushwork, "
+                "cheap plastic materials, low-poly geometry, flicker, jitter, "
+                "warping, morphing, unstable surfaces, temporal inconsistency"
+            ),
+        },
+        "digital_painting": {
+            "positive": (
+                "{term}\n"
+                "animated digital painting aesthetic\n"
+                "painterly brushwork\n"
+                "rich color transitions\n"
+                "atmospheric depth\n"
+                "dramatic lighting\n"
+                "stable painted forms across frames\n"
+                "controlled cinematic motion"
+            ),
+            "negative": (
+                "photorealistic live action, 3d render, anime cel shading, flat clipart, "
+                "unstable brushwork, flicker, jitter, warping, morphing, "
+                "temporal inconsistency, blurry, low detail"
+            ),
+        },
+        "oil_painting": {
+            "positive": (
+                "{term}\n"
+                "animated oil painting aesthetic\n"
+                "visible layered brushwork\n"
+                "rich pigments\n"
+                "subtle impasto texture\n"
+                "deep tonal modeling\n"
+                "stable painterly forms\n"
+                "slow elegant cinematic motion"
+            ),
+            "negative": (
+                "photorealistic live action, 3d render, anime cel shading, vector art, "
+                "flat digital shading, flicker, jitter, unstable brush texture, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "watercolor": {
+            "positive": (
+                "{term}\n"
+                "animated watercolor illustration\n"
+                "translucent pigment washes\n"
+                "soft color bleeding\n"
+                "delicate layered tones\n"
+                "visible paper texture\n"
+                "stable watercolor forms\n"
+                "gentle controlled motion"
+            ),
+            "negative": (
+                "photorealistic live action, 3d render, heavy opaque shading, "
+                "hard plastic surfaces, unstable pigment patterns, flicker, jitter, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "pencil_sketch": {
+            "positive": (
+                "{term}\n"
+                "animated graphite pencil sketch\n"
+                "precise contour drawing\n"
+                "natural cross-hatching\n"
+                "tonal shading\n"
+                "visible paper grain\n"
+                "stable drawn linework across frames\n"
+                "controlled subtle motion"
+            ),
+            "negative": (
+                "full color painting, photorealistic live action, 3d render, "
+                "anime cel shading, unstable sketch lines, flicker, jitter, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "charcoal_drawing": {
+            "positive": (
+                "{term}\n"
+                "animated charcoal drawing\n"
+                "bold gestural marks\n"
+                "deep blacks\n"
+                "smudged tonal gradients\n"
+                "textured paper\n"
+                "stable charcoal forms\n"
+                "expressive controlled motion"
+            ),
+            "negative": (
+                "full color painting, photorealistic live action, 3d render, "
+                "clean vector art, unstable charcoal texture, flicker, jitter, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "ink_illustration": {
+            "positive": (
+                "{term}\n"
+                "animated ink illustration\n"
+                "confident black linework\n"
+                "varied line weight\n"
+                "controlled hatching\n"
+                "crisp silhouettes\n"
+                "stable ink lines across frames\n"
+                "controlled graphic motion"
+            ),
+            "negative": (
+                "photorealistic live action, 3d render, soft airbrush rendering, "
+                "unstable linework, flicker, jitter, warping, morphing, "
+                "temporal inconsistency"
+            ),
+        },
+        "childrens_book": {
+            "positive": (
+                "{term}\n"
+                "animated children's book illustration\n"
+                "friendly stylized forms\n"
+                "soft shapes\n"
+                "charming expressive characters\n"
+                "gentle color palette\n"
+                "stable illustrated character design\n"
+                "warm storybook motion"
+            ),
+            "negative": (
+                "photorealistic live action, horror realism, gritty violence, "
+                "hyper-detailed 3d render, grotesque anatomy, flicker, jitter, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "retro_pulp": {
+            "positive": (
+                "{term}\n"
+                "animated mid-century pulp illustration\n"
+                "dramatic painted lighting\n"
+                "bold composition\n"
+                "vintage print character\n"
+                "saturated colors\n"
+                "stable painted character design\n"
+                "dynamic cinematic motion"
+            ),
+            "negative": (
+                "modern photorealistic live action, anime, manga, chibi, 3d render, "
+                "minimal flat vector art, flicker, jitter, unstable paint texture, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "fantasy_storybook": {
+            "positive": (
+                "{term}\n"
+                "animated fantasy storybook illustration\n"
+                "painterly enchanted atmosphere\n"
+                "intricate costumes and environments\n"
+                "luminous magical light\n"
+                "rich color harmony\n"
+                "stable illustrated forms\n"
+                "graceful cinematic motion"
+            ),
+            "negative": (
+                "photorealistic modern live action, industrial 3d render, flat clipart, "
+                "minimal vector art, flicker, jitter, unstable painted details, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "pixel_art": {
+            "positive": (
+                "{term}\n"
+                "animated pixel art scene\n"
+                "deliberate pixel clusters\n"
+                "crisp hard-edged forms\n"
+                "limited harmonious palette\n"
+                "readable silhouettes\n"
+                "stable pixel grid across frames\n"
+                "clean sprite-like motion"
+            ),
+            "negative": (
+                "photorealistic live action, smooth vector gradients, painterly brushwork, "
+                "3d render, anti-aliased soft edges, blurry pixels, unstable pixel grid, "
+                "flicker, warping, morphing, temporal inconsistency"
+            ),
+        },
+    },
+}
+
+
+def _apply_visual_style_preset(
+    provider,
+    selector_key,
+    positive_widget_key,
+    negative_widget_key=None,
+):
+    """Apply a style only when the user explicitly changes that provider's preset."""
+    provider_presets = VISUAL_STYLE_PRESETS.get(provider, {})
+    selected_preset = st.session_state.get(
+        localized_widget_key(selector_key),
+        VISUAL_STYLE_MANUAL,
+    )
+
+    if selected_preset == VISUAL_STYLE_MANUAL:
+        return
+
+    preset = provider_presets.get(selected_preset)
+    if not preset:
+        return
+
+    st.session_state[positive_widget_key] = str(
+        preset.get("positive", "") or ""
+    ).strip()
+
+    if negative_widget_key:
+        st.session_state[negative_widget_key] = str(
+            preset.get("negative", "") or ""
+        ).strip()
 
 
 def _saved_ui_number(key, default, minimum, maximum, number_type=float):
@@ -3136,7 +3971,13 @@ def _get_video_cache_stats(max_age_days=None):
     缓存键包含清理天数，因此切换范围只会为每个范围扫描一次；主动刷新或清理
     完成后会显式清空，最多 30 秒的缓存不会影响实际删除时的二次扫描。
     """
-    return cache_manager.get_video_cache_stats(max_age_days=max_age_days)
+    stats = cache_manager.get_video_cache_stats(max_age_days=max_age_days)
+    return (
+        stats.file_count,
+        stats.total_size,
+        stats.oldest_mtime,
+        stats.newest_mtime,
+    )
 
 
 def _render_cache_management_settings(panel):
@@ -3153,15 +3994,20 @@ def _render_cache_management_settings(panel):
         st.caption(tr("Video Cache Directory"))
         st.code(cache_manager.video_cache_dir(), language="text")
 
-        total_stats = _get_video_cache_stats()
+        (
+            total_file_count,
+            total_size,
+            total_oldest_mtime,
+            _,
+        ) = _get_video_cache_stats()
         metric_count, metric_size, metric_oldest = st.columns(3)
-        metric_count.metric(tr("Cache File Count"), total_stats.file_count)
+        metric_count.metric(tr("Cache File Count"), total_file_count)
         metric_size.metric(
-            tr("Cache Total Size"), _format_file_size(total_stats.total_size)
+            tr("Cache Total Size"), _format_file_size(total_size)
         )
         oldest_text = (
-            datetime.fromtimestamp(total_stats.oldest_mtime).strftime("%Y-%m-%d")
-            if total_stats.oldest_mtime is not None
+            datetime.fromtimestamp(total_oldest_mtime).strftime("%Y-%m-%d")
+            if total_oldest_mtime is not None
             else "-"
         )
         metric_oldest.metric(tr("Oldest Cache Date"), oldest_text)
@@ -3180,11 +4026,16 @@ def _render_cache_management_settings(panel):
             format_func=lambda value: cleanup_labels[value],
             key="video_cache_cleanup_range",
         )
-        cleanup_preview = _get_video_cache_stats(max_age_days=max_age_days)
+        (
+            cleanup_file_count,
+            cleanup_total_size,
+            _,
+            _,
+        ) = _get_video_cache_stats(max_age_days=max_age_days)
         st.info(
             tr("Cache Cleanup Preview").format(
-                count=cleanup_preview.file_count,
-                size=_format_file_size(cleanup_preview.total_size),
+                count=cleanup_file_count,
+                size=_format_file_size(cleanup_total_size),
             )
         )
 
@@ -3211,7 +4062,7 @@ def _render_cache_management_settings(panel):
         ):
             webbrowser.open(Path(cache_manager.video_cache_dir()).as_uri())
 
-        cleanup_disabled = not confirmed or cleanup_preview.file_count == 0
+        cleanup_disabled = not confirmed or cleanup_file_count == 0
         if cleanup_col.button(
             tr("Clean Cache Now"),
             key="clean_video_cache_now",
@@ -4374,6 +5225,32 @@ def _render_settings_dialog():
                 with st.expander(
                     tr("ComfyUI Video Advanced Settings"), expanded=False
                 ):
+                    comfyui_video_style_preset = stable_selectbox(
+                        tr("Visual Style Preset"),
+                        options=list(VISUAL_STYLE_PRESETS["comfyui_video"]),
+                        default_value=_saved_ui_choice(
+                            "comfyui_video_style_preset",
+                            list(VISUAL_STYLE_PRESETS["comfyui_video"]),
+                            VISUAL_STYLE_MANUAL,
+                        ),
+                        key="comfyui_video_style_preset_select",
+                        format_func=lambda value: tr(
+                            VISUAL_STYLE_PRESET_LABELS[value]
+                        ),
+                        on_change=_apply_visual_style_preset,
+                        args=(
+                            "comfyui_video",
+                            "comfyui_video_style_preset_select",
+                            "comfyui_video_prompt_template_input",
+                            "comfyui_video_negative_prompt_input",
+                        ),
+                    )
+                    _set_runtime_config(
+                        "ui",
+                        "comfyui_video_style_preset",
+                        comfyui_video_style_preset,
+                    )
+
                     comfyui_video_prompt_template = st.text_area(
                         tr("ComfyUI Video Prompt Template"),
                         value=str(
@@ -4402,7 +5279,7 @@ def _render_settings_dialog():
                             )
                             or ""
                         ),
-                        placeholder="text, watermark, logo, blurry, low quality",
+                        placeholder="blurry, low quality",
                         key="comfyui_video_negative_prompt_input",
                     )
                     _set_runtime_config(
@@ -4482,6 +5359,31 @@ def _render_settings_dialog():
                 with st.expander(
                     tr("OpenAI Image Advanced Settings"), expanded=False
                 ):
+                    openai_image_style_preset = stable_selectbox(
+                        tr("Visual Style Preset"),
+                        options=list(VISUAL_STYLE_PRESETS["openai_image"]),
+                        default_value=_saved_ui_choice(
+                            "openai_image_style_preset",
+                            list(VISUAL_STYLE_PRESETS["openai_image"]),
+                            VISUAL_STYLE_MANUAL,
+                        ),
+                        key="openai_image_style_preset_select",
+                        format_func=lambda value: tr(
+                            VISUAL_STYLE_PRESET_LABELS[value]
+                        ),
+                        on_change=_apply_visual_style_preset,
+                        args=(
+                            "openai_image",
+                            "openai_image_style_preset_select",
+                            "openai_image_prompt_template_input",
+                        ),
+                    )
+                    _set_runtime_config(
+                        "ui",
+                        "openai_image_style_preset",
+                        openai_image_style_preset,
+                    )
+
                     openai_image_size = st.text_input(
                         tr("OpenAI Image Size"),
                         value=str(config.app.get("openai_image_size", "") or ""),
@@ -4498,7 +5400,7 @@ def _render_settings_dialog():
                         value=str(
                             config.app.get("openai_image_prompt_template", "") or ""
                         ),
-                        placeholder="cinematic photo of {term}, photorealistic",
+                        placeholder="{term}",
                         help=tr("OpenAI Image Prompt Template Help"),
                         key="openai_image_prompt_template_input",
                     )
@@ -4559,6 +5461,32 @@ def _render_settings_dialog():
                 with st.expander(
                     tr("ComfyUI T2I Advanced Settings"), expanded=False
                 ):
+                    comfyui_t2i_style_preset = stable_selectbox(
+                        tr("Visual Style Preset"),
+                        options=list(VISUAL_STYLE_PRESETS["comfyui_t2i"]),
+                        default_value=_saved_ui_choice(
+                            "comfyui_t2i_style_preset",
+                            list(VISUAL_STYLE_PRESETS["comfyui_t2i"]),
+                            VISUAL_STYLE_MANUAL,
+                        ),
+                        key="comfyui_t2i_style_preset_select",
+                        format_func=lambda value: tr(
+                            VISUAL_STYLE_PRESET_LABELS[value]
+                        ),
+                        on_change=_apply_visual_style_preset,
+                        args=(
+                            "comfyui_t2i",
+                            "comfyui_t2i_style_preset_select",
+                            "comfyui_t2i_prompt_template_input",
+                            "comfyui_t2i_negative_prompt_input",
+                        ),
+                    )
+                    _set_runtime_config(
+                        "ui",
+                        "comfyui_t2i_style_preset",
+                        comfyui_t2i_style_preset,
+                    )
+
                     comfyui_t2i_prompt_template = st.text_area(
                         tr("ComfyUI T2I Prompt Template"),
                         value=str(
@@ -4587,7 +5515,7 @@ def _render_settings_dialog():
                             )
                             or ""
                         ),
-                        placeholder="text, watermark, logo, blurry, low quality",
+                        placeholder="blurry, low quality",
                         key="comfyui_t2i_negative_prompt_input",
                     )
                     _set_runtime_config(
@@ -7002,632 +7930,637 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
             else:
                 st.warning(tr("Voice Preview Duration Unavailable"))
 
-            timeline = cached_preview.get("narration_timeline")
-            if isinstance(timeline, dict) and timeline.get("segments"):
-                timing_source = str(timeline.get("timing_source") or "estimated")
-                source_labels = {
-                    "native": tr("Native timing"),
-                    "derived": tr("Derived timing"),
-                    "estimated": tr("Estimated timing"),
-                }
-                st.caption(
-                    tr("Narration Timeline Timing Source").format(
-                        source=source_labels.get(timing_source, timing_source)
-                    )
+            _render_audio_first_timeline_plan(params, cached_preview)
+
+
+def _render_audio_first_timeline_plan(params, cached_preview):
+    """Render the shared audio-first planning chain for any timed narration."""
+    timeline = cached_preview.get("narration_timeline")
+    if isinstance(timeline, dict) and timeline.get("segments"):
+        timing_source = str(timeline.get("timing_source") or "estimated")
+        source_labels = {
+            "native": tr("Native timing"),
+            "derived": tr("Derived timing"),
+            "estimated": tr("Estimated timing"),
+        }
+        st.caption(
+            tr("Narration Timeline Timing Source").format(
+                source=source_labels.get(timing_source, timing_source)
+            )
+        )
+        alignment_unit_count = len(timeline.get("alignment_units", []) or [])
+        if alignment_unit_count:
+            st.caption(
+                tr("Fine Alignment Units: {count}").format(
+                    count=alignment_unit_count
                 )
-                alignment_unit_count = len(timeline.get("alignment_units", []) or [])
-                if alignment_unit_count:
-                    st.caption(
-                        tr("Fine Alignment Units: {count}").format(
-                            count=alignment_unit_count
-                        )
-                    )
-                with st.expander(tr("Narration Timeline"), expanded=False):
-                    rows = []
-                    for segment in timeline.get("segments", []):
+            )
+        with st.expander(tr("Narration Timeline"), expanded=False):
+            rows = []
+            for segment in timeline.get("segments", []):
+                try:
+                    start = float(segment.get("start", 0.0))
+                    end = float(segment.get("end", start))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                rows.append(
+                    {
+                        "#": segment.get("index", len(rows) + 1),
+                        tr("Start"): round(start, 2),
+                        tr("End"): round(end, 2),
+                        tr("Duration"): round(max(0.0, end - start), 2),
+                        tr("Narration Text"): segment.get("text", ""),
+                    }
+                )
+            if rows:
+                st.dataframe(rows, hide_index=True, use_container_width=True)
+
+        # Audio-first phase 2 deliberately separates story semantics from media
+        # duration limits. Semantic scenes depend only on narration structure;
+        # Clip Duration is applied afterwards as a hard maximum for media shots.
+        try:
+            semantic_timeline = visual_timeline.build_visual_timeline(timeline)
+            shot_plan = media_shot_plan.build_media_shot_plan(
+                semantic_timeline,
+                max_clip_duration=float(params.video_clip_duration or 5),
+            )
+        except (TypeError, ValueError) as exc:
+            logger.warning(f"could not build visual media plan preview: {exc}")
+        else:
+            semantic_data = semantic_timeline.to_dict()
+            scene_segments = semantic_data.get("segments", [])
+            shot_data = shot_plan.to_dict()
+            shots = shot_data.get("shots", [])
+
+            if scene_segments:
+                st.caption(
+                    tr(
+                        "Semantic Scenes: {count}. These boundaries are independent of Clip Duration."
+                    ).format(count=len(scene_segments))
+                )
+                with st.expander(tr("Semantic Scene Timeline"), expanded=False):
+                    scene_rows = []
+                    for scene in scene_segments:
                         try:
-                            start = float(segment.get("start", 0.0))
-                            end = float(segment.get("end", start))
+                            start = float(scene.get("start", 0.0))
+                            end = float(scene.get("end", start))
                         except (TypeError, ValueError, OverflowError):
                             continue
-                        rows.append(
+                        source_indices = list(scene.get("narration_indices", []) or [])
+                        if source_indices:
+                            first_source = source_indices[0]
+                            last_source = source_indices[-1]
+                            narration_range = (
+                                str(first_source)
+                                if first_source == last_source
+                                else f"{first_source}–{last_source}"
+                            )
+                        else:
+                            narration_range = ""
+                        scene_rows.append(
                             {
-                                "#": segment.get("index", len(rows) + 1),
+                                tr("Scene"): scene.get("index", len(scene_rows) + 1),
                                 tr("Start"): round(start, 2),
                                 tr("End"): round(end, 2),
                                 tr("Duration"): round(max(0.0, end - start), 2),
-                                tr("Narration Text"): segment.get("text", ""),
+                                tr("Narration Units"): narration_range,
+                                tr("Narration Text"): scene.get("narration_text", ""),
                             }
                         )
-                    if rows:
-                        st.dataframe(rows, hide_index=True, use_container_width=True)
+                    if scene_rows:
+                        st.dataframe(
+                            scene_rows, hide_index=True, use_container_width=True
+                        )
 
-                # Audio-first phase 2 deliberately separates story semantics from media
-                # duration limits. Semantic scenes depend only on narration structure;
-                # Clip Duration is applied afterwards as a hard maximum for media shots.
+            if shots:
+                maximum = float(shot_data.get("max_clip_duration", 5.0))
+                minimum = float(
+                    shot_data.get(
+                        "min_clip_duration",
+                        min(
+                            media_shot_plan.DEFAULT_MINIMUM_SHOT_DURATION,
+                            maximum,
+                        ),
+                    )
+                )
+
+                # There is exactly one shot plan that matters downstream: the Active Shot Plan.
+                # Start with the deterministic plan and replace it only when a current, validated
+                # AI refinement exists. The original and refined plans are no longer presented as
+                # two competing tables that the user has to reconcile manually.
+                active_shot_plan = shot_plan
+                active_shot_data = shot_data
+                active_plan_source = "automatic"
+                active_refinement_summary = None
+
                 try:
-                    semantic_timeline = visual_timeline.build_visual_timeline(timeline)
-                    shot_plan = media_shot_plan.build_media_shot_plan(
-                        semantic_timeline,
-                        max_clip_duration=float(params.video_clip_duration or 5),
+                    refinement_candidates = (
+                        media_shot_refinement.build_refinement_candidates(
+                            semantic_timeline, shot_plan
+                        )
                     )
                 except (TypeError, ValueError) as exc:
-                    logger.warning(f"could not build visual media plan preview: {exc}")
-                else:
-                    semantic_data = semantic_timeline.to_dict()
-                    scene_segments = semantic_data.get("segments", [])
-                    shot_data = shot_plan.to_dict()
-                    shots = shot_data.get("shots", [])
+                    logger.warning(
+                        f"could not build AI shot refinement candidates: {exc}"
+                    )
+                    refinement_candidates = []
 
-                    if scene_segments:
-                        st.caption(
-                            tr(
-                                "Semantic Scenes: {count}. These boundaries are independent of Clip Duration."
-                            ).format(count=len(scene_segments))
-                        )
-                        with st.expander(tr("Semantic Scene Timeline"), expanded=False):
-                            scene_rows = []
-                            for scene in scene_segments:
-                                try:
-                                    start = float(scene.get("start", 0.0))
-                                    end = float(scene.get("end", start))
-                                except (TypeError, ValueError, OverflowError):
-                                    continue
-                                source_indices = list(scene.get("narration_indices", []) or [])
-                                if source_indices:
-                                    first_source = source_indices[0]
-                                    last_source = source_indices[-1]
-                                    narration_range = (
-                                        str(first_source)
-                                        if first_source == last_source
-                                        else f"{first_source}–{last_source}"
-                                    )
-                                else:
-                                    narration_range = ""
-                                scene_rows.append(
-                                    {
-                                        tr("Scene"): scene.get("index", len(scene_rows) + 1),
-                                        tr("Start"): round(start, 2),
-                                        tr("End"): round(end, 2),
-                                        tr("Duration"): round(max(0.0, end - start), 2),
-                                        tr("Narration Units"): narration_range,
-                                        tr("Narration Text"): scene.get("narration_text", ""),
-                                    }
-                                )
-                            if scene_rows:
-                                st.dataframe(
-                                    scene_rows, hide_index=True, use_container_width=True
-                                )
+                if refinement_candidates:
+                    refinement_fingerprint_payload = {
+                        "semantic_timeline": semantic_data,
+                        "shot_plan": shot_data,
+                    }
+                    refinement_fingerprint = hashlib.sha256(
+                        json.dumps(
+                            refinement_fingerprint_payload,
+                            sort_keys=True,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
 
-                    if shots:
-                        maximum = float(shot_data.get("max_clip_duration", 5.0))
-                        minimum = float(
-                            shot_data.get(
-                                "min_clip_duration",
-                                min(
-                                    media_shot_plan.DEFAULT_MINIMUM_SHOT_DURATION,
-                                    maximum,
-                                ),
-                            )
-                        )
-
-                        # There is exactly one shot plan that matters downstream: the Active Shot Plan.
-                        # Start with the deterministic plan and replace it only when a current, validated
-                        # AI refinement exists. The original and refined plans are no longer presented as
-                        # two competing tables that the user has to reconcile manually.
-                        active_shot_plan = shot_plan
-                        active_shot_data = shot_data
-                        active_plan_source = "automatic"
-                        active_refinement_summary = None
-
+                    st.caption(
+                        tr(
+                            "Optional AI refinement can review {count} uncertain internal cuts. "
+                            "It may only choose existing validated boundaries; timing coverage, "
+                            "shot count, order, preferred minimum, and hard maximum remain constrained."
+                        ).format(count=len(refinement_candidates))
+                    )
+                    if st.button(
+                        tr("Refine Active Shot Plan with AI"),
+                        key="refine_media_shot_plan_with_ai",
+                        use_container_width=True,
+                        type="secondary",
+                        icon=":material/auto_awesome:",
+                    ):
                         try:
-                            refinement_candidates = (
-                                media_shot_refinement.build_refinement_candidates(
-                                    semantic_timeline, shot_plan
-                                )
-                            )
-                        except (TypeError, ValueError) as exc:
-                            logger.warning(
-                                f"could not build AI shot refinement candidates: {exc}"
-                            )
-                            refinement_candidates = []
-
-                        if refinement_candidates:
-                            refinement_fingerprint_payload = {
-                                "semantic_timeline": semantic_data,
-                                "shot_plan": shot_data,
-                            }
-                            refinement_fingerprint = hashlib.sha256(
-                                json.dumps(
-                                    refinement_fingerprint_payload,
-                                    sort_keys=True,
-                                    ensure_ascii=False,
-                                    separators=(",", ":"),
-                                ).encode("utf-8")
-                            ).hexdigest()
-
-                            st.caption(
-                                tr(
-                                    "Optional AI refinement can review {count} uncertain internal cuts. "
-                                    "It may only choose existing validated boundaries; timing coverage, "
-                                    "shot count, order, preferred minimum, and hard maximum remain constrained."
-                                ).format(count=len(refinement_candidates))
-                            )
-                            if st.button(
-                                tr("Refine Active Shot Plan with AI"),
-                                key="refine_media_shot_plan_with_ai",
-                                use_container_width=True,
-                                type="secondary",
-                                icon=":material/auto_awesome:",
-                            ):
-                                try:
-                                    with st.spinner(tr("Refining Active Shot Plan")):
-                                        refinement_result = _run_llm_read_operation(
-                                            "refine_media_shot_plan",
-                                            lambda app_config_snapshot: (
-                                                media_shot_refinement.refine_media_shot_plan(
-                                                    semantic_timeline,
-                                                    shot_plan,
-                                                    response_generator=lambda prompt: llm._generate_response(
-                                                        prompt=prompt,
-                                                        app_config=app_config_snapshot,
-                                                    ),
-                                                )
+                            with st.spinner(tr("Refining Active Shot Plan")):
+                                refinement_result = _run_llm_read_operation(
+                                    "refine_media_shot_plan",
+                                    lambda app_config_snapshot: (
+                                        media_shot_refinement.refine_media_shot_plan(
+                                            semantic_timeline,
+                                            shot_plan,
+                                            response_generator=lambda prompt: llm._generate_response(
+                                                prompt=prompt,
+                                                app_config=app_config_snapshot,
                                             ),
                                         )
-                                except Exception as exc:
-                                    logger.exception("AI media shot refinement failed")
-                                    st.warning(
-                                        tr("AI Shot Refinement Failed").format(
-                                            error=str(exc)
-                                        )
-                                    )
-                                else:
-                                    st.session_state["media_shot_refinement_preview"] = {
-                                        "fingerprint": refinement_fingerprint,
-                                        "result": refinement_result.to_dict(),
-                                    }
-                                    # A changed shot plan invalidates every downstream visual/media plan.
-                                    st.session_state.pop("visual_shot_plan_preview", None)
-                                    st.session_state.pop("media_plan_preview", None)
-                                    st.session_state.pop(
-                                        "applied_visual_shot_plan_fingerprint", None
-                                    )
-                                    st.session_state.pop(
-                                        "applied_visual_shot_plan_voice_fingerprint", None
-                                    )
-
-                            cached_refinement = st.session_state.get(
-                                "media_shot_refinement_preview"
+                                    ),
+                                )
+                        except Exception as exc:
+                            logger.exception("AI media shot refinement failed")
+                            st.warning(
+                                tr("AI Shot Refinement Failed").format(
+                                    error=str(exc)
+                                )
                             )
-                            if (
-                                isinstance(cached_refinement, dict)
-                                and cached_refinement.get("fingerprint")
-                                == refinement_fingerprint
-                                and isinstance(cached_refinement.get("result"), dict)
-                            ):
-                                refined_result = cached_refinement["result"]
-                                refined_plan = refined_result.get("plan", {}) or {}
-                                refined_shots = list(refined_plan.get("shots", []) or [])
-                                # The refinement service guarantees the same shot count and rebuilds
-                                # through the deterministic validator. Keep a defensive UI check too.
-                                if refined_shots and len(refined_shots) == len(shots):
-                                    active_shot_plan = refined_plan
-                                    active_shot_data = refined_plan
-                                    active_plan_source = "ai_refined"
-                                    active_refinement_summary = tr(
-                                        "AI reviewed {eligible} candidate scenes and changed {refined}; "
-                                        "rejected choices: {rejected}."
-                                    ).format(
-                                        eligible=refined_result.get(
-                                            "eligible_scene_count", 0
-                                        ),
-                                        refined=refined_result.get(
-                                            "refined_scene_count", 0
-                                        ),
-                                        rejected=refined_result.get(
-                                            "rejected_choice_count", 0
-                                        ),
-                                    )
-
-                                    if st.button(
-                                        tr("Use Automatic Shot Plan"),
-                                        key="discard_media_shot_plan_refinement",
-                                        use_container_width=True,
-                                        help=tr(
-                                            "Discard the current AI refinement and return the deterministic Media Shot Plan to Active Shot Plan."
-                                        ),
-                                    ):
-                                        st.session_state.pop(
-                                            "media_shot_refinement_preview", None
-                                        )
-                                        st.session_state.pop(
-                                            "visual_shot_plan_preview", None
-                                        )
-                                        st.session_state.pop("media_plan_preview", None)
-                                        st.session_state.pop(
-                                            "applied_visual_shot_plan_fingerprint", None
-                                        )
-                                        st.session_state.pop(
-                                            "applied_visual_shot_plan_voice_fingerprint",
-                                            None,
-                                        )
-                                        st.rerun()
-
-                        active_shots = list(active_shot_data.get("shots", []) or [])
-                        active_maximum = float(
-                            active_shot_data.get("max_clip_duration", maximum) or maximum
-                        )
-                        active_minimum = float(
-                            active_shot_data.get("min_clip_duration", minimum) or minimum
-                        )
-                        active_undersized_count = int(
-                            active_shot_data.get("undersized_shot_count", 0) or 0
-                        )
-                        active_estimated_cut_count = sum(
-                            1
-                            for shot in active_shots
-                            if shot.get("uses_internal_estimate")
-                        )
-
-                        source_label = (
-                            tr("AI-Refined")
-                            if active_plan_source == "ai_refined"
-                            else tr("Automatic")
-                        )
-                        st.caption(
-                            tr(
-                                "Active Shot Plan: {source} · {count} shots · preferred minimum "
-                                "{minimum:.1f}s · hard maximum {maximum:.1f}s."
-                            ).format(
-                                source=source_label,
-                                count=len(active_shots),
-                                minimum=active_minimum,
-                                maximum=active_maximum,
-                            )
-                        )
-                        if active_refinement_summary:
-                            st.caption(active_refinement_summary)
-                        if active_undersized_count:
-                            st.caption(
-                                tr(
-                                    "{count} active shots remain below the preferred minimum because "
-                                    "no safe boundary adjustment can remove them without breaking the hard maximum."
-                                ).format(count=active_undersized_count)
-                            )
-                        if active_estimated_cut_count:
-                            st.caption(
-                                tr(
-                                    "{count} active shots still use an internal duration-limit cut because "
-                                    "no validated narration/alignment boundary was available at a safe position."
-                                ).format(count=active_estimated_cut_count)
-                            )
-
-                        with st.expander(tr("Active Shot Plan"), expanded=False):
-                            active_rows = []
-                            for active_shot in active_shots:
-                                try:
-                                    active_start = float(
-                                        active_shot.get("start", 0.0)
-                                    )
-                                    active_end = float(
-                                        active_shot.get("end", active_start)
-                                    )
-                                except (
-                                    TypeError,
-                                    ValueError,
-                                    OverflowError,
-                                ):
-                                    continue
-                                active_scene_indices = list(
-                                    active_shot.get("scene_indices", [])
-                                    or [active_shot.get("scene_index", "")]
-                                )
-                                active_scene_indices = [
-                                    value
-                                    for value in active_scene_indices
-                                    if value != ""
-                                ]
-                                if active_scene_indices:
-                                    first_active_scene = active_scene_indices[0]
-                                    last_active_scene = active_scene_indices[-1]
-                                    active_scene_range = (
-                                        str(first_active_scene)
-                                        if first_active_scene == last_active_scene
-                                        else f"{first_active_scene}–{last_active_scene}"
-                                    )
-                                else:
-                                    active_scene_range = ""
-
-                                active_narration_indices = list(
-                                    active_shot.get("narration_indices", []) or []
-                                )
-                                if active_narration_indices:
-                                    first_active_narration = active_narration_indices[0]
-                                    last_active_narration = active_narration_indices[-1]
-                                    active_narration_range = (
-                                        str(first_active_narration)
-                                        if first_active_narration
-                                        == last_active_narration
-                                        else f"{first_active_narration}–{last_active_narration}"
-                                    )
-                                else:
-                                    active_narration_range = ""
-
-                                active_end_source = str(
-                                    active_shot.get("end_boundary_source")
-                                    or "scene_boundary"
-                                )
-                                active_cut_label = {
-                                    "scene_boundary": tr("Scene boundary"),
-                                    "narration_boundary": tr("Narration boundary"),
-                                    "alignment_boundary": tr("Aligned boundary"),
-                                    "balanced_internal_cut": tr("Duration-limit cut"),
-                                }.get(active_end_source, active_end_source)
-                                active_rows.append(
-                                    {
-                                        "#": active_shot.get(
-                                            "index", len(active_rows) + 1
-                                        ),
-                                        tr("Scene"): active_scene_range,
-                                        tr("Start"): round(active_start, 2),
-                                        tr("End"): round(active_end, 2),
-                                        tr("Duration"): round(
-                                            max(0.0, active_end - active_start),
-                                            2,
-                                        ),
-                                        tr("End Cut"): active_cut_label,
-                                        tr("Narration Units"): active_narration_range,
-                                        tr("Narration Text"): active_shot.get(
-                                            "narration_text", ""
-                                        ),
-                                    }
-                                )
-                            if active_rows:
-                                st.dataframe(
-                                    active_rows,
-                                    hide_index=True,
-                                    use_container_width=True,
-                                )
-
-                        # The Active Shot Plan is the only timing plan handed to the visual layer.
-                        # Generating visual prompts also applies them immediately, removing the former
-                        # "Generate Visual Shot Plan" -> table -> "Use as Visual Prompts" ceremony.
-                        if _uses_ai_visual_prompts(params.video_source):
-                            visual_plan_fingerprint_payload = {
-                                "shot_plan": active_shot_data,
-                                "video_subject": str(
-                                    params.video_subject or ""
-                                ).strip(),
+                        else:
+                            st.session_state["media_shot_refinement_preview"] = {
+                                "fingerprint": refinement_fingerprint,
+                                "result": refinement_result.to_dict(),
                             }
-                            visual_plan_fingerprint = hashlib.sha256(
-                                json.dumps(
-                                    visual_plan_fingerprint_payload,
-                                    sort_keys=True,
-                                    ensure_ascii=False,
-                                    separators=(",", ":"),
-                                ).encode("utf-8")
-                            ).hexdigest()
-
-                            try:
-                                visual_payload = (
-                                    visual_shot_planner.build_visual_shot_payload(
-                                        active_shot_plan
-                                    )
-                                )
-                            except (TypeError, ValueError) as exc:
-                                logger.warning(
-                                    f"could not build visual shot planner payload: {exc}"
-                                )
-                                visual_payload = []
-
-                            # Any previously applied plan belongs to another Active Shot Plan when
-                            # its fingerprint differs. Invalidate it before Generate Video can reuse
-                            # stale timing.
-                            applied_visual_fingerprint = str(
-                                st.session_state.get(
-                                    "applied_visual_shot_plan_fingerprint", ""
-                                )
-                                or ""
+                            # A changed shot plan invalidates every downstream visual/media plan.
+                            st.session_state.pop("visual_shot_plan_preview", None)
+                            st.session_state.pop("media_plan_preview", None)
+                            st.session_state.pop(
+                                "applied_visual_shot_plan_fingerprint", None
                             )
-                            if (
-                                applied_visual_fingerprint
-                                and applied_visual_fingerprint
-                                != visual_plan_fingerprint
+                            st.session_state.pop(
+                                "applied_visual_shot_plan_voice_fingerprint", None
+                            )
+
+                    cached_refinement = st.session_state.get(
+                        "media_shot_refinement_preview"
+                    )
+                    if (
+                        isinstance(cached_refinement, dict)
+                        and cached_refinement.get("fingerprint")
+                        == refinement_fingerprint
+                        and isinstance(cached_refinement.get("result"), dict)
+                    ):
+                        refined_result = cached_refinement["result"]
+                        refined_plan = refined_result.get("plan", {}) or {}
+                        refined_shots = list(refined_plan.get("shots", []) or [])
+                        # The refinement service guarantees the same shot count and rebuilds
+                        # through the deterministic validator. Keep a defensive UI check too.
+                        if refined_shots and len(refined_shots) == len(shots):
+                            active_shot_plan = refined_plan
+                            active_shot_data = refined_plan
+                            active_plan_source = "ai_refined"
+                            active_refinement_summary = tr(
+                                "AI reviewed {eligible} candidate scenes and changed {refined}; "
+                                "rejected choices: {rejected}."
+                            ).format(
+                                eligible=refined_result.get(
+                                    "eligible_scene_count", 0
+                                ),
+                                refined=refined_result.get(
+                                    "refined_scene_count", 0
+                                ),
+                                rejected=refined_result.get(
+                                    "rejected_choice_count", 0
+                                ),
+                            )
+
+                            if st.button(
+                                tr("Use Automatic Shot Plan"),
+                                key="discard_media_shot_plan_refinement",
+                                use_container_width=True,
+                                help=tr(
+                                    "Discard the current AI refinement and return the deterministic Media Shot Plan to Active Shot Plan."
+                                ),
                             ):
+                                st.session_state.pop(
+                                    "media_shot_refinement_preview", None
+                                )
+                                st.session_state.pop(
+                                    "visual_shot_plan_preview", None
+                                )
+                                st.session_state.pop("media_plan_preview", None)
                                 st.session_state.pop(
                                     "applied_visual_shot_plan_fingerprint", None
                                 )
                                 st.session_state.pop(
-                                    "applied_visual_shot_plan_voice_fingerprint", None
+                                    "applied_visual_shot_plan_voice_fingerprint",
+                                    None,
                                 )
-                                st.session_state.pop("media_plan_preview", None)
+                                st.rerun()
 
-                            if visual_payload:
-                                shared_narration_count = sum(
-                                    1
-                                    for item in visual_payload
-                                    if item.get("shared_narration_with_previous")
-                                )
-                                st.caption(
+                active_shots = list(active_shot_data.get("shots", []) or [])
+                active_maximum = float(
+                    active_shot_data.get("max_clip_duration", maximum) or maximum
+                )
+                active_minimum = float(
+                    active_shot_data.get("min_clip_duration", minimum) or minimum
+                )
+                active_undersized_count = int(
+                    active_shot_data.get("undersized_shot_count", 0) or 0
+                )
+                active_estimated_cut_count = sum(
+                    1
+                    for shot in active_shots
+                    if shot.get("uses_internal_estimate")
+                )
+
+                source_label = (
+                    tr("AI-Refined")
+                    if active_plan_source == "ai_refined"
+                    else tr("Automatic")
+                )
+                st.caption(
+                    tr(
+                        "Active Shot Plan: {source} · {count} shots · preferred minimum "
+                        "{minimum:.1f}s · hard maximum {maximum:.1f}s."
+                    ).format(
+                        source=source_label,
+                        count=len(active_shots),
+                        minimum=active_minimum,
+                        maximum=active_maximum,
+                    )
+                )
+                if active_refinement_summary:
+                    st.caption(active_refinement_summary)
+                if active_undersized_count:
+                    st.caption(
+                        tr(
+                            "{count} active shots remain below the preferred minimum because "
+                            "no safe boundary adjustment can remove them without breaking the hard maximum."
+                        ).format(count=active_undersized_count)
+                    )
+                if active_estimated_cut_count:
+                    st.caption(
+                        tr(
+                            "{count} active shots still use an internal duration-limit cut because "
+                            "no validated narration/alignment boundary was available at a safe position."
+                        ).format(count=active_estimated_cut_count)
+                    )
+
+                with st.expander(tr("Active Shot Plan"), expanded=False):
+                    active_rows = []
+                    for active_shot in active_shots:
+                        try:
+                            active_start = float(
+                                active_shot.get("start", 0.0)
+                            )
+                            active_end = float(
+                                active_shot.get("end", active_start)
+                            )
+                        except (
+                            TypeError,
+                            ValueError,
+                            OverflowError,
+                        ):
+                            continue
+                        active_scene_indices = list(
+                            active_shot.get("scene_indices", [])
+                            or [active_shot.get("scene_index", "")]
+                        )
+                        active_scene_indices = [
+                            value
+                            for value in active_scene_indices
+                            if value != ""
+                        ]
+                        if active_scene_indices:
+                            first_active_scene = active_scene_indices[0]
+                            last_active_scene = active_scene_indices[-1]
+                            active_scene_range = (
+                                str(first_active_scene)
+                                if first_active_scene == last_active_scene
+                                else f"{first_active_scene}–{last_active_scene}"
+                            )
+                        else:
+                            active_scene_range = ""
+
+                        active_narration_indices = list(
+                            active_shot.get("narration_indices", []) or []
+                        )
+                        if active_narration_indices:
+                            first_active_narration = active_narration_indices[0]
+                            last_active_narration = active_narration_indices[-1]
+                            active_narration_range = (
+                                str(first_active_narration)
+                                if first_active_narration
+                                == last_active_narration
+                                else f"{first_active_narration}–{last_active_narration}"
+                            )
+                        else:
+                            active_narration_range = ""
+
+                        active_end_source = str(
+                            active_shot.get("end_boundary_source")
+                            or "scene_boundary"
+                        )
+                        active_cut_label = {
+                            "scene_boundary": tr("Scene boundary"),
+                            "narration_boundary": tr("Narration boundary"),
+                            "alignment_boundary": tr("Aligned boundary"),
+                            "balanced_internal_cut": tr("Duration-limit cut"),
+                        }.get(active_end_source, active_end_source)
+                        active_rows.append(
+                            {
+                                "#": active_shot.get(
+                                    "index", len(active_rows) + 1
+                                ),
+                                tr("Scene"): active_scene_range,
+                                tr("Start"): round(active_start, 2),
+                                tr("End"): round(active_end, 2),
+                                tr("Duration"): round(
+                                    max(0.0, active_end - active_start),
+                                    2,
+                                ),
+                                tr("End Cut"): active_cut_label,
+                                tr("Narration Units"): active_narration_range,
+                                tr("Narration Text"): active_shot.get(
+                                    "narration_text", ""
+                                ),
+                            }
+                        )
+                    if active_rows:
+                        st.dataframe(
+                            active_rows,
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
+                # The Active Shot Plan is the only timing plan handed to the visual layer.
+                # Generating visual prompts also applies them immediately, removing the former
+                # "Generate Visual Shot Plan" -> table -> "Use as Visual Prompts" ceremony.
+                if active_shot_data:
+                    visual_plan_fingerprint_payload = {
+                        "shot_plan": active_shot_data,
+                        "video_subject": str(
+                            params.video_subject or ""
+                        ).strip(),
+                    }
+                    visual_plan_fingerprint = hashlib.sha256(
+                        json.dumps(
+                            visual_plan_fingerprint_payload,
+                            sort_keys=True,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+
+                    try:
+                        visual_payload = (
+                            visual_shot_planner.build_visual_shot_payload(
+                                active_shot_plan
+                            )
+                        )
+                    except (TypeError, ValueError) as exc:
+                        logger.warning(
+                            f"could not build visual shot planner payload: {exc}"
+                        )
+                        visual_payload = []
+
+                    # Any previously applied plan belongs to another Active Shot Plan when
+                    # its fingerprint differs. Invalidate it before Generate Video can reuse
+                    # stale timing.
+                    applied_visual_fingerprint = str(
+                        st.session_state.get(
+                            "applied_visual_shot_plan_fingerprint", ""
+                        )
+                        or ""
+                    )
+                    if (
+                        applied_visual_fingerprint
+                        and applied_visual_fingerprint
+                        != visual_plan_fingerprint
+                    ):
+                        st.session_state.pop(
+                            "applied_visual_shot_plan_fingerprint", None
+                        )
+                        st.session_state.pop(
+                            "applied_visual_shot_plan_voice_fingerprint", None
+                        )
+                        st.session_state.pop("media_plan_preview", None)
+
+                    if visual_payload:
+                        shared_narration_count = sum(
+                            1
+                            for item in visual_payload
+                            if item.get("shared_narration_with_previous")
+                        )
+                        st.caption(
+                            tr(
+                                "Generate one unique visual prompt for each of the {count} Active Shot Plan windows. "
+                                "{shared} shots continue narration already present in the previous shot. "
+                                "The generated prompts are applied to Visual Prompts automatically."
+                            ).format(
+                                count=len(visual_payload),
+                                shared=shared_narration_count,
+                            )
+                        )
+
+                        if st.button(
+                            tr(
+                                "Generate Visual Prompts from Active Shot Plan"
+                            ),
+                            key="generate_visual_prompts_from_active_shot_plan",
+                            use_container_width=True,
+                            type="primary",
+                            icon=":material/movie_edit:",
+                        ):
+                            try:
+                                with st.spinner(
                                     tr(
-                                        "Generate one unique visual prompt for each of the {count} Active Shot Plan windows. "
-                                        "{shared} shots continue narration already present in the previous shot. "
-                                        "The generated prompts are applied to Visual Prompts automatically."
-                                    ).format(
-                                        count=len(visual_payload),
-                                        shared=shared_narration_count,
+                                        "Generating Visual Prompts from Active Shot Plan"
                                     )
-                                )
-
-                                if st.button(
-                                    tr(
-                                        "Generate Visual Prompts from Active Shot Plan"
-                                    ),
-                                    key="generate_visual_prompts_from_active_shot_plan",
-                                    use_container_width=True,
-                                    type="primary",
-                                    icon=":material/movie_edit:",
                                 ):
-                                    try:
-                                        with st.spinner(
-                                            tr(
-                                                "Generating Visual Prompts from Active Shot Plan"
-                                            )
-                                        ):
-                                            visual_plan_result = _run_llm_read_operation(
-                                                "generate_visual_shot_plan",
-                                                lambda app_config_snapshot: (
-                                                    visual_shot_planner.generate_visual_shot_plan(
-                                                        active_shot_plan,
-                                                        video_subject=params.video_subject,
-                                                        response_generator=lambda prompt: llm._generate_response(
-                                                            prompt=prompt,
-                                                            app_config=app_config_snapshot,
-                                                            json_mode=True,
-                                                        ),
-                                                    )
+                                    visual_plan_result = _run_llm_read_operation(
+                                        "generate_visual_shot_plan",
+                                        lambda app_config_snapshot: (
+                                            visual_shot_planner.generate_visual_shot_plan(
+                                                active_shot_plan,
+                                                video_subject=params.video_subject,
+                                                response_generator=lambda prompt: llm._generate_response(
+                                                    prompt=prompt,
+                                                    app_config=app_config_snapshot,
+                                                    json_mode=True,
                                                 ),
                                             )
-                                    except Exception:
-                                        logger.exception(
-                                            "AI visual shot planning failed"
-                                        )
-                                        st.warning(
-                                            tr("Visual Shot Planning Failed")
-                                        )
-                                    else:
-                                        visual_plan_data = (
-                                            visual_plan_result.to_dict()
-                                        )
-                                        visual_prompt_lines = [
-                                            str(prompt or "").strip()
-                                            for prompt in visual_plan_data.get(
-                                                "visual_prompts", []
-                                            )
-                                            if str(prompt or "").strip()
-                                        ]
-                                        if len(visual_prompt_lines) != len(
-                                            visual_payload
-                                        ):
-                                            st.error(
-                                                tr(
-                                                    "Visual Shot Planning Failed"
-                                                ).format(
-                                                    error=(
-                                                        "the generated visual prompt count "
-                                                        "does not match Active Shot Plan"
-                                                    )
-                                                )
-                                            )
-                                        else:
-                                            st.session_state[
-                                                "visual_shot_plan_preview"
-                                            ] = {
-                                                "fingerprint": visual_plan_fingerprint,
-                                                "result": visual_plan_data,
-                                            }
-                                            st.session_state[
-                                                "_pending_visual_shot_prompts"
-                                            ] = "\n".join(visual_prompt_lines)
-                                            st.session_state[
-                                                "applied_visual_shot_plan_fingerprint"
-                                            ] = visual_plan_fingerprint
-                                            st.session_state[
-                                                "applied_visual_shot_plan_voice_fingerprint"
-                                            ] = str(
-                                                cached_preview.get(
-                                                    "fingerprint", ""
-                                                )
-                                                if isinstance(
-                                                    cached_preview, dict
-                                                )
-                                                else ""
-                                            )
-                                            # A new visual plan must rebuild any per-shot hybrid
-                                            # provider proposal from those exact new prompts.
-                                            st.session_state.pop(
-                                                "media_plan_preview", None
-                                            )
-                                            st.rerun()
-
-                                cached_visual_plan = st.session_state.get(
-                                    "visual_shot_plan_preview"
+                                        ),
+                                    )
+                            except Exception:
+                                logger.exception(
+                                    "AI visual shot planning failed"
                                 )
-                                if (
-                                    isinstance(cached_visual_plan, dict)
-                                    and cached_visual_plan.get("fingerprint")
-                                    == visual_plan_fingerprint
-                                    and isinstance(
-                                        cached_visual_plan.get("result"), dict
+                                st.warning(
+                                    tr("Visual Shot Planning Failed")
+                                )
+                            else:
+                                visual_plan_data = (
+                                    visual_plan_result.to_dict()
+                                )
+                                visual_prompt_lines = [
+                                    str(prompt or "").strip()
+                                    for prompt in visual_plan_data.get(
+                                        "visual_prompts", []
                                     )
+                                    if str(prompt or "").strip()
+                                ]
+                                if len(visual_prompt_lines) != len(
+                                    visual_payload
                                 ):
-                                    visual_plan_data = cached_visual_plan["result"]
-                                    visual_shots = list(
-                                        visual_plan_data.get("shots", []) or []
-                                    )
-                                    visual_prompt_lines = [
-                                        str(prompt or "").strip()
-                                        for prompt in visual_plan_data.get(
-                                            "visual_prompts", []
-                                        )
-                                        if str(prompt or "").strip()
-                                    ]
-                                    current_prompt_lines = (
-                                        _video_term_lines_for_timeline(
-                                            getattr(params, "video_terms", None)
-                                        )
-                                    )
-                                    visual_plan_applied = (
-                                        bool(visual_prompt_lines)
-                                        and current_prompt_lines
-                                        == visual_prompt_lines
-                                        and str(
-                                            st.session_state.get(
-                                                "applied_visual_shot_plan_fingerprint",
-                                                "",
+                                    st.error(
+                                        tr(
+                                            "Visual Shot Planning Failed"
+                                        ).format(
+                                            error=(
+                                                "the generated visual prompt count "
+                                                "does not match Active Shot Plan"
                                             )
-                                            or ""
                                         )
-                                        == visual_plan_fingerprint
                                     )
+                                else:
+                                    st.session_state[
+                                        "visual_shot_plan_preview"
+                                    ] = {
+                                        "fingerprint": visual_plan_fingerprint,
+                                        "result": visual_plan_data,
+                                    }
+                                    st.session_state[
+                                        "_pending_visual_shot_prompts"
+                                    ] = "\n".join(visual_prompt_lines)
+                                    st.session_state[
+                                        "applied_visual_shot_plan_fingerprint"
+                                    ] = visual_plan_fingerprint
+                                    st.session_state[
+                                        "applied_visual_shot_plan_voice_fingerprint"
+                                    ] = str(
+                                        cached_preview.get(
+                                            "fingerprint", ""
+                                        )
+                                        if isinstance(
+                                            cached_preview, dict
+                                        )
+                                        else ""
+                                    )
+                                    # A new visual plan must rebuild any per-shot hybrid
+                                    # provider proposal from those exact new prompts.
+                                    st.session_state.pop(
+                                        "media_plan_preview", None
+                                    )
+                                    st.rerun()
 
-                                    if visual_plan_applied:
-                                        st.success(
-                                            tr(
-                                                "{count} Visual Prompts from Active Shot Plan are applied."
-                                            ).format(
-                                                count=len(visual_prompt_lines)
-                                            )
-                                        )
-                                    else:
-                                        st.warning(
-                                            tr(
-                                                "The generated Visual Prompts are no longer applied. Regenerate them from Active Shot Plan before timeline-aware generation."
-                                            )
-                                        )
+                        cached_visual_plan = st.session_state.get(
+                            "visual_shot_plan_preview"
+                        )
+                        if (
+                            isinstance(cached_visual_plan, dict)
+                            and cached_visual_plan.get("fingerprint")
+                            == visual_plan_fingerprint
+                            and isinstance(
+                                cached_visual_plan.get("result"), dict
+                            )
+                        ):
+                            visual_plan_data = cached_visual_plan["result"]
+                            visual_shots = list(
+                                visual_plan_data.get("shots", []) or []
+                            )
+                            visual_prompt_lines = [
+                                str(prompt or "").strip()
+                                for prompt in visual_plan_data.get(
+                                    "visual_prompts", []
+                                )
+                                if str(prompt or "").strip()
+                            ]
+                            current_prompt_lines = (
+                                _video_term_lines_for_timeline(
+                                    getattr(params, "video_terms", None)
+                                )
+                            )
+                            visual_plan_applied = (
+                                bool(visual_prompt_lines)
+                                and current_prompt_lines
+                                == visual_prompt_lines
+                                and str(
+                                    st.session_state.get(
+                                        "applied_visual_shot_plan_fingerprint",
+                                        "",
+                                    )
+                                    or ""
+                                )
+                                == visual_plan_fingerprint
+                            )
 
-                                    # Per-shot provider planning is a hybrid-only concern. Single
-                                    # Source stops here and uses the selected Video Source for every
-                                    # locked shot.
-                                    if (
-                                        str(
-                                            getattr(
-                                                params,
-                                                "media_source_mode",
-                                                MEDIA_SOURCE_MODE_SINGLE,
-                                            )
-                                            or ""
-                                        )
-                                        == MEDIA_SOURCE_MODE_HYBRID
-                                        and visual_plan_applied
-                                        and visual_shots
-                                    ):
-                                        _render_media_planner(
-                                            visual_shots,
-                                            visual_plan_fingerprint,
-                                            params,
-                                        )
+                            if visual_plan_applied:
+                                st.success(
+                                    tr(
+                                        "{count} Visual Prompts from Active Shot Plan are applied."
+                                    ).format(
+                                        count=len(visual_prompt_lines)
+                                    )
+                                )
+                            else:
+                                st.warning(
+                                    tr(
+                                        "The generated Visual Prompts are no longer applied. Regenerate them from Active Shot Plan before timeline-aware generation."
+                                    )
+                                )
+
+                            # Per-shot provider planning is a hybrid-only concern. Single
+                            # Source stops here and uses the selected Video Source for every
+                            # locked shot.
+                            if (
+                                str(
+                                    getattr(
+                                        params,
+                                        "media_source_mode",
+                                        MEDIA_SOURCE_MODE_SINGLE,
+                                    )
+                                    or ""
+                                )
+                                == MEDIA_SOURCE_MODE_HYBRID
+                                and visual_plan_applied
+                                and visual_shots
+                            ):
+                                _render_media_planner(
+                                    visual_shots,
+                                    visual_plan_fingerprint,
+                                    params,
+                                )
 
 
 def _video_term_lines_for_timeline(value) -> list[str]:
@@ -7672,7 +8605,7 @@ def _has_explicit_current_media_plan(params) -> bool:
 
 
 def _matching_applied_media_shot_timeline(
-    params, reusable_voice_preview: dict | None
+    params, narration_preview: dict | None
 ) -> list[dict] | None:
     raw_media_plan = getattr(params, "media_plan", None) or None
     if not raw_media_plan and not timeline_media.is_timeline_aware_generated_source(
@@ -7707,19 +8640,18 @@ def _matching_applied_media_shot_timeline(
             "the applied Visual Shot Plan no longer contains one timing window per prompt"
         )
 
-    if not reusable_voice_preview:
+    if not narration_preview:
         raise timeline_media.TimelineMediaError(
-            "the applied Visual Shot Plan requires the matching Full Audio preview; "
-            "generate Full Audio again before starting timeline-aware generation"
+            "the applied Visual Shot Plan requires matching narration timing; "
+            "analyze or generate the current voiceover again before timeline-aware generation"
         )
 
     applied_voice_fingerprint = str(
         st.session_state.get("applied_visual_shot_plan_voice_fingerprint", "") or ""
     )
-    current_voice_preview = st.session_state.get("voice_preview_audio")
     current_voice_fingerprint = str(
-        current_voice_preview.get("fingerprint", "")
-        if isinstance(current_voice_preview, dict)
+        narration_preview.get("fingerprint", "")
+        if isinstance(narration_preview, dict)
         else ""
     )
     if (
@@ -7727,11 +8659,11 @@ def _matching_applied_media_shot_timeline(
         or current_voice_fingerprint != applied_voice_fingerprint
     ):
         raise timeline_media.TimelineMediaError(
-            "the applied Visual Shot Plan belongs to a different voiceover preview; "
-            "regenerate the Visual Shot Plan after the current Full Audio"
+            "the applied Visual Shot Plan belongs to different narration timing; "
+            "regenerate the Visual Shot Plan after the current voiceover"
         )
 
-    duration = reusable_voice_preview.get("duration")
+    duration = narration_preview.get("duration")
     normalized_timeline = timeline_media.normalize_locked_shot_timeline(
         raw_shots,
         audio_duration=float(duration),
@@ -7804,6 +8736,7 @@ def _get_reusable_full_voice_preview(params, voice_mode: str) -> dict | None:
     return {
         "audio_bytes": bytes(cached_preview["audio_bytes"]),
         "duration": float(duration),
+        "fingerprint": expected_fingerprint,
         "sub_maker": cached_preview["sub_maker"],
         "narration_timeline": cached_preview.get("narration_timeline"),
         "script": script_content,
@@ -8333,6 +9266,216 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
         st.warning(tr("ElevenLabs API Key Required"))
     st.session_state["last_rendered_bgm_type"] = params.bgm_type
     return uploaded_bgm_file
+
+
+def _uploaded_narration_fingerprint(script: str, uploaded_audio_file) -> str:
+    """Bind uploaded narration analysis to both the exact script and audio bytes."""
+    digest = hashlib.sha256()
+    digest.update(b"enigmaprinter-uploaded-narration-v1\0")
+    digest.update(str(script or "").strip().encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(uploaded_audio_file.getbuffer())
+    return digest.hexdigest()
+
+
+def _invalidate_uploaded_narration_downstream_state():
+    """Drop plans that were derived from a previous script/audio pair."""
+    for key in (
+        "media_shot_refinement_preview",
+        "visual_shot_plan_preview",
+        "media_plan_preview",
+        "applied_visual_shot_plan_fingerprint",
+        "applied_visual_shot_plan_voice_fingerprint",
+    ):
+        st.session_state.pop(key, None)
+
+
+def _analyze_uploaded_narration(params, uploaded_audio_file) -> dict:
+    script_content = str(params.video_script or "").strip()
+    if not script_content:
+        raise narration_alignment.NarrationAlignmentError(
+            "script must contain narration text"
+        )
+
+    audio_bytes = bytes(uploaded_audio_file.getbuffer())
+    fingerprint = _uploaded_narration_fingerprint(
+        script_content,
+        uploaded_audio_file,
+    )
+    temp_dir = utils.storage_dir("temp", create=True)
+    temp_audio_path = _build_uploaded_file_path(
+        uploaded_audio_file,
+        temp_dir,
+        CUSTOM_AUDIO_EXTENSIONS,
+        "uploaded-narration-analysis",
+    )
+    try:
+        with open(temp_audio_path, "wb") as file:
+            file.write(audio_bytes)
+        alignment = narration_alignment.align_external_narration(
+            audio_file=temp_audio_path,
+            script=script_content,
+        )
+    finally:
+        try:
+            os.remove(temp_audio_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(
+                "failed to delete uploaded narration analysis file: "
+                f"path={temp_audio_path}, error={exc}"
+            )
+
+    timeline = alignment.timeline.to_dict()
+    duration = float(timeline.get("audio_duration", 0.0) or 0.0)
+    mime_type = str(getattr(uploaded_audio_file, "type", "") or "").strip()
+    if not mime_type.startswith("audio/"):
+        mime_type = (
+            mimetypes.guess_type(str(uploaded_audio_file.name or ""))[0]
+            or "audio/mpeg"
+        )
+
+    return {
+        "preview_type": "uploaded",
+        "fingerprint": fingerprint,
+        "duration": duration,
+        "mime_type": mime_type,
+        "narration_timeline": timeline,
+        "content_digest": hashlib.sha256(
+            script_content.encode("utf-8")
+        ).hexdigest(),
+        "alignment_summary": {
+            "matched": alignment.matched_word_count,
+            "script": alignment.script_word_count,
+            "recognized": alignment.recognized_word_count,
+            "script_coverage": alignment.script_coverage,
+            "recognized_coverage": alignment.recognized_coverage,
+        },
+    }
+
+
+def _get_matching_uploaded_narration_preview(
+    params,
+    uploaded_audio_file,
+) -> dict | None:
+    if uploaded_audio_file is None:
+        return None
+    script_content = str(params.video_script or "").strip()
+    if not script_content:
+        return None
+    try:
+        expected_fingerprint = _uploaded_narration_fingerprint(
+            script_content,
+            uploaded_audio_file,
+        )
+    except Exception:
+        return None
+
+    cached_preview = st.session_state.get("voice_preview_audio")
+    if (
+        not isinstance(cached_preview, dict)
+        or cached_preview.get("preview_type") != "uploaded"
+        or cached_preview.get("fingerprint") != expected_fingerprint
+        or not isinstance(cached_preview.get("narration_timeline"), dict)
+        or not cached_preview["narration_timeline"].get("segments")
+    ):
+        return None
+
+    duration = cached_preview.get("duration")
+    if (
+        not isinstance(duration, (int, float))
+        or not math.isfinite(duration)
+        or duration <= 0
+    ):
+        return None
+    return cached_preview
+
+
+def _render_uploaded_narration_analysis(params, uploaded_audio_file):
+    """Analyze uploaded voiceover against the current script, then reuse audio-first UI."""
+    if uploaded_audio_file is None:
+        return
+
+    script_content = str(params.video_script or "").strip()
+    if not script_content:
+        st.caption(tr("Voiceover Script Required"))
+        return
+
+    current_fingerprint = _uploaded_narration_fingerprint(
+        script_content,
+        uploaded_audio_file,
+    )
+    cached_preview = st.session_state.get("voice_preview_audio")
+    if (
+        isinstance(cached_preview, dict)
+        and cached_preview.get("preview_type") == "uploaded"
+        and cached_preview.get("fingerprint") != current_fingerprint
+    ):
+        st.session_state.pop("voice_preview_audio", None)
+        _invalidate_uploaded_narration_downstream_state()
+        cached_preview = None
+
+    analyze_requested = st.button(
+        tr("Analyze Uploaded Narration"),
+        key="analyze_uploaded_narration_button",
+        icon=":material/graphic_eq:",
+        use_container_width=True,
+        help=tr("Analyze Uploaded Narration Help"),
+    )
+    if analyze_requested and (
+        not isinstance(cached_preview, dict)
+        or cached_preview.get("fingerprint") != current_fingerprint
+    ):
+        try:
+            with st.spinner(tr("Analyzing Uploaded Narration")):
+                preview_result = _analyze_uploaded_narration(
+                    params,
+                    uploaded_audio_file,
+                )
+        except narration_alignment.NarrationAlignmentError as exc:
+            logger.warning(f"uploaded narration alignment rejected: {exc}")
+            if (
+                isinstance(cached_preview, dict)
+                and cached_preview.get("preview_type") == "uploaded"
+            ):
+                st.session_state.pop("voice_preview_audio", None)
+            _invalidate_uploaded_narration_downstream_state()
+            st.error(
+                tr("Uploaded Narration Alignment Failed").format(error=str(exc))
+            )
+            return
+        except Exception as exc:
+            logger.exception("uploaded narration analysis failed")
+            _invalidate_uploaded_narration_downstream_state()
+            st.error(
+                tr("Uploaded Narration Alignment Failed").format(error=str(exc))
+            )
+            return
+        else:
+            _invalidate_uploaded_narration_downstream_state()
+            st.session_state["voice_preview_audio"] = preview_result
+            cached_preview = preview_result
+
+    cached_preview = _get_matching_uploaded_narration_preview(
+        params,
+        uploaded_audio_file,
+    )
+    if not cached_preview:
+        return
+
+    summary = cached_preview.get("alignment_summary", {}) or {}
+    st.success(
+        tr("Uploaded Narration Alignment Summary").format(
+            matched=int(summary.get("matched", 0) or 0),
+            script=int(summary.get("script", 0) or 0),
+            coverage=float(summary.get("script_coverage", 0.0) or 0.0),
+            recognized_coverage=float(
+                summary.get("recognized_coverage", 0.0) or 0.0
+            ),
+        )
+    )
+    _render_audio_first_timeline_plan(params, cached_preview)
 
 
 def _render_audio_settings(panel, params):
@@ -8980,6 +10123,10 @@ def _render_audio_settings(panel, params):
                         tr(
                             "Custom audio will be used directly. TTS synthesis will be skipped for this task."
                         )
+                    )
+                    _render_uploaded_narration_analysis(
+                        params,
+                        uploaded_audio_file,
                     )
             uploaded_bgm_file = _render_background_music_settings(
                 params,
@@ -9666,6 +10813,12 @@ def _render_generation_controls(
             params,
             voice_mode,
         )
+        timeline_voice_preview = reusable_voice_preview
+        if voice_mode == VOICE_MODE_UPLOAD:
+            timeline_voice_preview = _get_matching_uploaded_narration_preview(
+                params,
+                uploaded_audio_file,
+            )
 
         # The Media Plan is advisory until the user explicitly enables hybrid
         # dispatch. Keeping it out of VideoParams here preserves both the legacy
@@ -9676,7 +10829,7 @@ def _render_generation_controls(
         try:
             params.media_shot_timeline = _matching_applied_media_shot_timeline(
                 params,
-                reusable_voice_preview,
+                timeline_voice_preview,
             )
         except timeline_media.TimelineMediaError as exc:
             _remove_active_generation_task(task_id)
