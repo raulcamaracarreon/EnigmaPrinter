@@ -460,6 +460,840 @@ def _saved_ui_choice(key, options, default):
     return default
 
 
+VISUAL_STYLE_MANUAL = "manual"
+
+VISUAL_STYLE_PRESET_LABELS = {
+    VISUAL_STYLE_MANUAL: "Custom / Manual",
+    "cinematic_realism": "Cinematic Realism",
+    "photorealistic": "Photorealistic",
+    "cinematic_graphic_novel": "Cinematic Graphic Novel",
+    "noir_graphic_novel": "Noir Graphic Novel",
+    "anime": "Anime",
+    "chibi": "Chibi",
+    "three_d_animated_film": "3D Animated Film",
+    "three_d_realistic_render": "3D Realistic Render",
+    "digital_painting": "Digital Painting",
+    "oil_painting": "Oil Painting",
+    "watercolor": "Watercolor",
+    "pencil_sketch": "Pencil Sketch",
+    "charcoal_drawing": "Charcoal Drawing",
+    "ink_illustration": "Ink Illustration",
+    "childrens_book": "Children's Book",
+    "retro_pulp": "Retro Pulp",
+    "fantasy_storybook": "Fantasy Storybook",
+    "pixel_art": "Pixel Art",
+}
+
+VISUAL_STYLE_PRESETS = {
+    "openai_image": {
+        VISUAL_STYLE_MANUAL: {
+            "positive": "",
+            "negative": "",
+        },
+        "cinematic_realism": {
+            "positive": (
+                "{term}. Cinematic realism, grounded live-action visual language, "
+                "natural skin and materials, dramatic but plausible lighting, "
+                "sophisticated composition, realistic color grading, high detail."
+            ),
+            "negative": "",
+        },
+        "photorealistic": {
+            "positive": (
+                "{term}. Photorealistic still image, true-to-life proportions, "
+                "physically plausible lighting, natural textures and materials, "
+                "realistic lens behavior, documentary-level detail."
+            ),
+            "negative": "",
+        },
+        "cinematic_graphic_novel": {
+            "positive": (
+                "{term}. Modern graphic novel illustration, European graphic novel "
+                "aesthetic, mature semi-realistic character design, expressive ink "
+                "linework, painted shadows, cinematic framing, sophisticated color palette."
+            ),
+            "negative": "",
+        },
+        "noir_graphic_novel": {
+            "positive": (
+                "{term}. Noir graphic novel illustration, mature European comic "
+                "aesthetic, high-contrast chiaroscuro, expressive ink linework, "
+                "restrained palette, moody cinematic composition, suspenseful atmosphere."
+            ),
+            "negative": "",
+        },
+        "anime": {
+            "positive": (
+                "{term}. High-quality cinematic anime illustration, expressive "
+                "linework, refined cel shading, detailed background art, coherent "
+                "character design, dramatic composition."
+            ),
+            "negative": "",
+        },
+        "chibi": {
+            "positive": (
+                "{term}. Polished chibi illustration, super-deformed proportions, "
+                "oversized expressive head, compact body, clean linework, soft cel "
+                "shading, cohesive character design, detailed environment."
+            ),
+            "negative": "",
+        },
+        "three_d_animated_film": {
+            "positive": (
+                "{term}. High-end 3D animated film aesthetic, expressive stylized "
+                "characters, polished cinematic lighting, detailed modeled environments, "
+                "appealing materials, strong silhouette design, feature-animation quality."
+            ),
+            "negative": "",
+        },
+        "three_d_realistic_render": {
+            "positive": (
+                "{term}. High-end realistic 3D render, physically based materials, "
+                "global illumination, realistic reflections, detailed geometry, "
+                "cinematic lighting, sophisticated camera composition."
+            ),
+            "negative": "",
+        },
+        "digital_painting": {
+            "positive": (
+                "{term}. Refined digital painting, painterly brushwork, rich color "
+                "transitions, atmospheric depth, dramatic lighting, detailed forms, "
+                "cinematic composition, professional concept-art finish."
+            ),
+            "negative": "",
+        },
+        "oil_painting": {
+            "positive": (
+                "{term}. Traditional oil painting aesthetic, visible layered brushwork, "
+                "rich pigments, subtle impasto texture, deep tonal modeling, atmospheric "
+                "light, classical painterly composition."
+            ),
+            "negative": "",
+        },
+        "watercolor": {
+            "positive": (
+                "{term}. Expressive watercolor illustration, translucent pigment washes, "
+                "soft color bleeding, delicate layered tones, visible paper texture, "
+                "controlled loose edges, elegant atmospheric composition."
+            ),
+            "negative": "",
+        },
+        "pencil_sketch": {
+            "positive": (
+                "{term}. Detailed graphite pencil sketch, precise contour drawing, "
+                "natural cross-hatching, tonal shading, visible paper grain, confident "
+                "draftsmanship, refined monochrome illustration."
+            ),
+            "negative": "",
+        },
+        "charcoal_drawing": {
+            "positive": (
+                "{term}. Dramatic charcoal drawing, bold gestural marks, deep blacks, "
+                "smudged tonal gradients, textured paper, expressive contrast, "
+                "hand-drawn fine-art character."
+            ),
+            "negative": "",
+        },
+        "ink_illustration": {
+            "positive": (
+                "{term}. Detailed ink illustration, confident black linework, varied "
+                "line weight, controlled hatching, crisp silhouettes, handcrafted "
+                "editorial drawing aesthetic."
+            ),
+            "negative": "",
+        },
+        "childrens_book": {
+            "positive": (
+                "{term}. Warm children's book illustration, friendly stylized forms, "
+                "soft shapes, charming expressive characters, gentle color palette, "
+                "clear storytelling composition, polished hand-illustrated finish."
+            ),
+            "negative": "",
+        },
+        "retro_pulp": {
+            "positive": (
+                "{term}. Mid-century pulp magazine illustration, dramatic painted "
+                "lighting, bold composition, vintage print character, saturated colors, "
+                "expressive faces, adventurous cinematic staging."
+            ),
+            "negative": "",
+        },
+        "fantasy_storybook": {
+            "positive": (
+                "{term}. Lavish fantasy storybook illustration, painterly enchanted "
+                "atmosphere, intricate costumes and environments, luminous magical light, "
+                "rich color harmony, elegant narrative composition."
+            ),
+            "negative": "",
+        },
+        "pixel_art": {
+            "positive": (
+                "{term}. Detailed pixel art scene, deliberate pixel clusters, crisp "
+                "hard-edged forms, limited harmonious palette, readable silhouettes, "
+                "carefully rendered environment, polished retro game artwork."
+            ),
+            "negative": "",
+        },
+    },
+    "comfyui_t2i": {
+        VISUAL_STYLE_MANUAL: {
+            "positive": "",
+            "negative": "",
+        },
+        "cinematic_realism": {
+            "positive": (
+                "{term}\n"
+                "cinematic realism\n"
+                "grounded live-action visual language\n"
+                "natural skin and realistic materials\n"
+                "dramatic but plausible lighting\n"
+                "cinematic composition\n"
+                "realistic color grading\n"
+                "high detail"
+            ),
+            "negative": (
+                "anime, manga, chibi, cartoon, 3d render, plastic skin, "
+                "distorted anatomy, extra limbs, extra fingers, bad hands, "
+                "deformed face, blurry, low detail"
+            ),
+        },
+        "photorealistic": {
+            "positive": (
+                "{term}\n"
+                "photorealistic still image\n"
+                "true-to-life proportions\n"
+                "physically plausible lighting\n"
+                "natural textures and materials\n"
+                "realistic lens behavior\n"
+                "documentary-level detail"
+            ),
+            "negative": (
+                "anime, manga, chibi, cartoon, illustration, 3d render, "
+                "plastic skin, distorted anatomy, extra limbs, extra fingers, "
+                "bad hands, deformed face, blurry, low detail"
+            ),
+        },
+        "cinematic_graphic_novel": {
+            "positive": (
+                "{term}\n"
+                "modern graphic novel illustration\n"
+                "European graphic novel aesthetic\n"
+                "mature semi-realistic character design\n"
+                "expressive ink linework\n"
+                "painted shadows\n"
+                "cinematic framing\n"
+                "sophisticated color palette"
+            ),
+            "negative": (
+                "anime, manga, chibi, photorealistic, 3d render, childish cartoon, "
+                "flat clipart, distorted anatomy, extra limbs, extra fingers, "
+                "bad hands, deformed face, blurry, low detail"
+            ),
+        },
+        "noir_graphic_novel": {
+            "positive": (
+                "{term}\n"
+                "noir graphic novel illustration\n"
+                "mature European comic aesthetic\n"
+                "high-contrast chiaroscuro\n"
+                "expressive ink linework\n"
+                "restrained color palette\n"
+                "moody cinematic composition\n"
+                "suspenseful atmosphere"
+            ),
+            "negative": (
+                "anime, manga, chibi, photorealistic, 3d render, childish cartoon, "
+                "flat clipart, distorted anatomy, extra limbs, extra fingers, "
+                "bad hands, blurry, low detail"
+            ),
+        },
+        "anime": {
+            "positive": (
+                "{term}\n"
+                "cinematic anime illustration\n"
+                "high quality anime scene\n"
+                "clean expressive linework\n"
+                "refined cel shading\n"
+                "detailed background art\n"
+                "coherent character design\n"
+                "dramatic composition"
+            ),
+            "negative": (
+                "photorealistic, live action, American superhero comic, chibi, "
+                "3d render, distorted anatomy, extra limbs, extra fingers, "
+                "bad hands, deformed face, blurry, low detail"
+            ),
+        },
+        "chibi": {
+            "positive": (
+                "{term}\n"
+                "polished chibi illustration\n"
+                "super-deformed proportions\n"
+                "oversized expressive head\n"
+                "compact body\n"
+                "clean linework\n"
+                "soft cel shading\n"
+                "cohesive character design"
+            ),
+            "negative": (
+                "photorealistic, live action, realistic body proportions, "
+                "3d render, grotesque anatomy, extra limbs, extra fingers, "
+                "malformed hands, blurry, low detail"
+            ),
+        },
+        "three_d_animated_film": {
+            "positive": (
+                "{term}\n"
+                "high-end 3d animated film aesthetic\n"
+                "expressive stylized characters\n"
+                "polished cinematic lighting\n"
+                "detailed modeled environments\n"
+                "appealing materials\n"
+                "strong silhouette design\n"
+                "feature-animation quality"
+            ),
+            "negative": (
+                "photorealistic live action, anime, manga, flat illustration, "
+                "cheap plastic look, low-poly artifacts, distorted anatomy, "
+                "extra limbs, bad hands, blurry, low detail"
+            ),
+        },
+        "three_d_realistic_render": {
+            "positive": (
+                "{term}\n"
+                "high-end realistic 3d render\n"
+                "physically based materials\n"
+                "global illumination\n"
+                "realistic reflections\n"
+                "detailed geometry\n"
+                "cinematic lighting\n"
+                "sophisticated camera composition"
+            ),
+            "negative": (
+                "anime, manga, chibi, flat cartoon, sketch, painterly brushwork, "
+                "cheap plastic materials, low-poly geometry, distorted anatomy, "
+                "extra limbs, bad hands, blurry, low detail"
+            ),
+        },
+        "digital_painting": {
+            "positive": (
+                "{term}\n"
+                "refined digital painting\n"
+                "painterly brushwork\n"
+                "rich color transitions\n"
+                "atmospheric depth\n"
+                "dramatic lighting\n"
+                "detailed forms\n"
+                "professional concept-art finish"
+            ),
+            "negative": (
+                "photorealistic photo, 3d render, anime, manga, chibi, flat clipart, "
+                "rough unfinished sketch, distorted anatomy, extra limbs, bad hands, "
+                "blurry, low detail"
+            ),
+        },
+        "oil_painting": {
+            "positive": (
+                "{term}\n"
+                "traditional oil painting aesthetic\n"
+                "visible layered brushwork\n"
+                "rich pigments\n"
+                "subtle impasto texture\n"
+                "deep tonal modeling\n"
+                "atmospheric light\n"
+                "classical painterly composition"
+            ),
+            "negative": (
+                "photorealistic photo, 3d render, anime, manga, chibi, vector art, "
+                "flat digital shading, distorted anatomy, extra limbs, bad hands, "
+                "blurry, low detail"
+            ),
+        },
+        "watercolor": {
+            "positive": (
+                "{term}\n"
+                "expressive watercolor illustration\n"
+                "translucent pigment washes\n"
+                "soft color bleeding\n"
+                "delicate layered tones\n"
+                "visible paper texture\n"
+                "controlled loose edges\n"
+                "elegant atmospheric composition"
+            ),
+            "negative": (
+                "photorealistic photo, 3d render, heavy opaque digital shading, "
+                "hard plastic surfaces, anime cel shading, vector art, muddy colors, "
+                "distorted anatomy, blurry, low detail"
+            ),
+        },
+        "pencil_sketch": {
+            "positive": (
+                "{term}\n"
+                "detailed graphite pencil sketch\n"
+                "precise contour drawing\n"
+                "natural cross-hatching\n"
+                "tonal shading\n"
+                "visible paper grain\n"
+                "confident draftsmanship\n"
+                "refined monochrome illustration"
+            ),
+            "negative": (
+                "full color painting, photorealistic photo, 3d render, anime cel shading, "
+                "vector art, marker rendering, distorted anatomy, extra limbs, "
+                "bad hands, blurry, low detail"
+            ),
+        },
+        "charcoal_drawing": {
+            "positive": (
+                "{term}\n"
+                "dramatic charcoal drawing\n"
+                "bold gestural marks\n"
+                "deep blacks\n"
+                "smudged tonal gradients\n"
+                "textured paper\n"
+                "expressive contrast\n"
+                "hand-drawn fine-art character"
+            ),
+            "negative": (
+                "full color painting, photorealistic photo, 3d render, clean vector art, "
+                "anime cel shading, glossy digital finish, distorted anatomy, "
+                "extra limbs, blurry, low detail"
+            ),
+        },
+        "ink_illustration": {
+            "positive": (
+                "{term}\n"
+                "detailed ink illustration\n"
+                "confident black linework\n"
+                "varied line weight\n"
+                "controlled hatching\n"
+                "crisp silhouettes\n"
+                "handcrafted editorial drawing aesthetic"
+            ),
+            "negative": (
+                "photorealistic photo, 3d render, soft airbrush rendering, "
+                "anime cel shading, painterly color wash, weak linework, "
+                "distorted anatomy, extra limbs, bad hands, blurry"
+            ),
+        },
+        "childrens_book": {
+            "positive": (
+                "{term}\n"
+                "warm children's book illustration\n"
+                "friendly stylized forms\n"
+                "soft shapes\n"
+                "charming expressive characters\n"
+                "gentle color palette\n"
+                "clear storytelling composition\n"
+                "polished hand-illustrated finish"
+            ),
+            "negative": (
+                "photorealistic, horror realism, gritty violence, grotesque anatomy, "
+                "hyper-detailed 3d render, harsh noir lighting, distorted anatomy, "
+                "extra limbs, frightening facial distortion"
+            ),
+        },
+        "retro_pulp": {
+            "positive": (
+                "{term}\n"
+                "mid-century pulp magazine illustration\n"
+                "dramatic painted lighting\n"
+                "bold composition\n"
+                "vintage print character\n"
+                "saturated colors\n"
+                "expressive faces\n"
+                "adventurous cinematic staging"
+            ),
+            "negative": (
+                "modern photorealistic photography, anime, manga, chibi, 3d render, "
+                "minimal flat vector art, sterile digital gradients, distorted anatomy, "
+                "extra limbs, blurry, low detail"
+            ),
+        },
+        "fantasy_storybook": {
+            "positive": (
+                "{term}\n"
+                "lavish fantasy storybook illustration\n"
+                "painterly enchanted atmosphere\n"
+                "intricate costumes and environments\n"
+                "luminous magical light\n"
+                "rich color harmony\n"
+                "elegant narrative composition"
+            ),
+            "negative": (
+                "photorealistic modern photography, industrial 3d render, flat clipart, "
+                "minimalist vector art, anime chibi proportions, distorted anatomy, "
+                "extra limbs, blurry, low detail"
+            ),
+        },
+        "pixel_art": {
+            "positive": (
+                "{term}\n"
+                "detailed pixel art scene\n"
+                "deliberate pixel clusters\n"
+                "crisp hard-edged forms\n"
+                "limited harmonious palette\n"
+                "readable silhouettes\n"
+                "carefully rendered environment\n"
+                "polished retro game artwork"
+            ),
+            "negative": (
+                "photorealistic, smooth vector gradients, painterly brushwork, "
+                "3d render, anti-aliased soft edges, blurry pixels, noisy dithering, "
+                "distorted anatomy, unreadable silhouettes"
+            ),
+        },
+    },
+    "comfyui_video": {
+        VISUAL_STYLE_MANUAL: {
+            "positive": "",
+            "negative": "",
+        },
+        "cinematic_realism": {
+            "positive": (
+                "{term}\n"
+                "cinematic realism\n"
+                "grounded live-action visual language\n"
+                "natural skin and realistic materials\n"
+                "dramatic but plausible lighting\n"
+                "cinematic camera movement\n"
+                "smooth natural motion\n"
+                "coherent character appearance across frames"
+            ),
+            "negative": (
+                "anime, manga, chibi, cartoon, 3d render, plastic skin, "
+                "distorted anatomy, extra limbs, bad hands, flicker, jitter, "
+                "warping, morphing, temporal inconsistency, blurry, low detail"
+            ),
+        },
+        "photorealistic": {
+            "positive": (
+                "{term}\n"
+                "photorealistic cinematic video\n"
+                "true-to-life proportions\n"
+                "physically plausible lighting\n"
+                "natural textures and materials\n"
+                "realistic camera behavior\n"
+                "smooth natural motion\n"
+                "stable temporal consistency"
+            ),
+            "negative": (
+                "anime, manga, chibi, cartoon, illustration, 3d render, "
+                "plastic skin, distorted anatomy, extra limbs, bad hands, "
+                "flicker, jitter, warping, morphing, temporal inconsistency, "
+                "blurry, low detail"
+            ),
+        },
+        "cinematic_graphic_novel": {
+            "positive": (
+                "{term}\n"
+                "animated modern graphic novel aesthetic\n"
+                "European graphic novel style\n"
+                "mature semi-realistic character design\n"
+                "expressive ink linework\n"
+                "painted shadows\n"
+                "cinematic framing\n"
+                "consistent linework across frames\n"
+                "controlled natural motion"
+            ),
+            "negative": (
+                "anime, manga, chibi, photorealistic, 3d render, childish cartoon, "
+                "flat clipart, distorted anatomy, extra limbs, bad hands, "
+                "flicker, jitter, linework instability, warping, morphing, "
+                "temporal inconsistency"
+            ),
+        },
+        "noir_graphic_novel": {
+            "positive": (
+                "{term}\n"
+                "animated noir graphic novel aesthetic\n"
+                "mature European comic style\n"
+                "high-contrast chiaroscuro\n"
+                "expressive ink linework\n"
+                "restrained palette\n"
+                "moody cinematic framing\n"
+                "stable illustrated character design\n"
+                "controlled natural motion"
+            ),
+            "negative": (
+                "anime, manga, chibi, photorealistic, 3d render, childish cartoon, "
+                "flat clipart, distorted anatomy, flicker, jitter, unstable linework, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "anime": {
+            "positive": (
+                "{term}\n"
+                "cinematic anime animation\n"
+                "clean expressive linework\n"
+                "refined cel shading\n"
+                "detailed anime background art\n"
+                "coherent character design\n"
+                "fluid natural motion\n"
+                "stable appearance across frames"
+            ),
+            "negative": (
+                "photorealistic, live action, American superhero comic, chibi, "
+                "3d render, distorted anatomy, extra limbs, bad hands, flicker, "
+                "jitter, warping, morphing, temporal inconsistency"
+            ),
+        },
+        "chibi": {
+            "positive": (
+                "{term}\n"
+                "polished chibi animation\n"
+                "super-deformed proportions\n"
+                "oversized expressive head\n"
+                "compact body\n"
+                "clean linework\n"
+                "soft cel shading\n"
+                "cohesive character design\n"
+                "smooth playful motion"
+            ),
+            "negative": (
+                "photorealistic, live action, realistic body proportions, "
+                "3d render, grotesque anatomy, extra limbs, malformed hands, "
+                "flicker, jitter, warping, morphing, temporal inconsistency"
+            ),
+        },
+        "three_d_animated_film": {
+            "positive": (
+                "{term}\n"
+                "high-end 3d animated film aesthetic\n"
+                "expressive stylized characters\n"
+                "polished cinematic lighting\n"
+                "detailed modeled environments\n"
+                "appealing materials\n"
+                "smooth feature-animation motion\n"
+                "stable character design across frames"
+            ),
+            "negative": (
+                "photorealistic live action, anime, manga, flat illustration, "
+                "cheap plastic look, low-poly artifacts, distorted anatomy, "
+                "flicker, jitter, warping, morphing, temporal inconsistency"
+            ),
+        },
+        "three_d_realistic_render": {
+            "positive": (
+                "{term}\n"
+                "realistic cinematic 3d animation\n"
+                "physically based materials\n"
+                "global illumination\n"
+                "realistic reflections\n"
+                "detailed geometry\n"
+                "natural cinematic camera motion\n"
+                "stable realistic surfaces across frames"
+            ),
+            "negative": (
+                "anime, manga, chibi, flat cartoon, painterly brushwork, "
+                "cheap plastic materials, low-poly geometry, flicker, jitter, "
+                "warping, morphing, unstable surfaces, temporal inconsistency"
+            ),
+        },
+        "digital_painting": {
+            "positive": (
+                "{term}\n"
+                "animated digital painting aesthetic\n"
+                "painterly brushwork\n"
+                "rich color transitions\n"
+                "atmospheric depth\n"
+                "dramatic lighting\n"
+                "stable painted forms across frames\n"
+                "controlled cinematic motion"
+            ),
+            "negative": (
+                "photorealistic live action, 3d render, anime cel shading, flat clipart, "
+                "unstable brushwork, flicker, jitter, warping, morphing, "
+                "temporal inconsistency, blurry, low detail"
+            ),
+        },
+        "oil_painting": {
+            "positive": (
+                "{term}\n"
+                "animated oil painting aesthetic\n"
+                "visible layered brushwork\n"
+                "rich pigments\n"
+                "subtle impasto texture\n"
+                "deep tonal modeling\n"
+                "stable painterly forms\n"
+                "slow elegant cinematic motion"
+            ),
+            "negative": (
+                "photorealistic live action, 3d render, anime cel shading, vector art, "
+                "flat digital shading, flicker, jitter, unstable brush texture, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "watercolor": {
+            "positive": (
+                "{term}\n"
+                "animated watercolor illustration\n"
+                "translucent pigment washes\n"
+                "soft color bleeding\n"
+                "delicate layered tones\n"
+                "visible paper texture\n"
+                "stable watercolor forms\n"
+                "gentle controlled motion"
+            ),
+            "negative": (
+                "photorealistic live action, 3d render, heavy opaque shading, "
+                "hard plastic surfaces, unstable pigment patterns, flicker, jitter, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "pencil_sketch": {
+            "positive": (
+                "{term}\n"
+                "animated graphite pencil sketch\n"
+                "precise contour drawing\n"
+                "natural cross-hatching\n"
+                "tonal shading\n"
+                "visible paper grain\n"
+                "stable drawn linework across frames\n"
+                "controlled subtle motion"
+            ),
+            "negative": (
+                "full color painting, photorealistic live action, 3d render, "
+                "anime cel shading, unstable sketch lines, flicker, jitter, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "charcoal_drawing": {
+            "positive": (
+                "{term}\n"
+                "animated charcoal drawing\n"
+                "bold gestural marks\n"
+                "deep blacks\n"
+                "smudged tonal gradients\n"
+                "textured paper\n"
+                "stable charcoal forms\n"
+                "expressive controlled motion"
+            ),
+            "negative": (
+                "full color painting, photorealistic live action, 3d render, "
+                "clean vector art, unstable charcoal texture, flicker, jitter, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "ink_illustration": {
+            "positive": (
+                "{term}\n"
+                "animated ink illustration\n"
+                "confident black linework\n"
+                "varied line weight\n"
+                "controlled hatching\n"
+                "crisp silhouettes\n"
+                "stable ink lines across frames\n"
+                "controlled graphic motion"
+            ),
+            "negative": (
+                "photorealistic live action, 3d render, soft airbrush rendering, "
+                "unstable linework, flicker, jitter, warping, morphing, "
+                "temporal inconsistency"
+            ),
+        },
+        "childrens_book": {
+            "positive": (
+                "{term}\n"
+                "animated children's book illustration\n"
+                "friendly stylized forms\n"
+                "soft shapes\n"
+                "charming expressive characters\n"
+                "gentle color palette\n"
+                "stable illustrated character design\n"
+                "warm storybook motion"
+            ),
+            "negative": (
+                "photorealistic live action, horror realism, gritty violence, "
+                "hyper-detailed 3d render, grotesque anatomy, flicker, jitter, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "retro_pulp": {
+            "positive": (
+                "{term}\n"
+                "animated mid-century pulp illustration\n"
+                "dramatic painted lighting\n"
+                "bold composition\n"
+                "vintage print character\n"
+                "saturated colors\n"
+                "stable painted character design\n"
+                "dynamic cinematic motion"
+            ),
+            "negative": (
+                "modern photorealistic live action, anime, manga, chibi, 3d render, "
+                "minimal flat vector art, flicker, jitter, unstable paint texture, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "fantasy_storybook": {
+            "positive": (
+                "{term}\n"
+                "animated fantasy storybook illustration\n"
+                "painterly enchanted atmosphere\n"
+                "intricate costumes and environments\n"
+                "luminous magical light\n"
+                "rich color harmony\n"
+                "stable illustrated forms\n"
+                "graceful cinematic motion"
+            ),
+            "negative": (
+                "photorealistic modern live action, industrial 3d render, flat clipart, "
+                "minimal vector art, flicker, jitter, unstable painted details, "
+                "warping, morphing, temporal inconsistency"
+            ),
+        },
+        "pixel_art": {
+            "positive": (
+                "{term}\n"
+                "animated pixel art scene\n"
+                "deliberate pixel clusters\n"
+                "crisp hard-edged forms\n"
+                "limited harmonious palette\n"
+                "readable silhouettes\n"
+                "stable pixel grid across frames\n"
+                "clean sprite-like motion"
+            ),
+            "negative": (
+                "photorealistic live action, smooth vector gradients, painterly brushwork, "
+                "3d render, anti-aliased soft edges, blurry pixels, unstable pixel grid, "
+                "flicker, warping, morphing, temporal inconsistency"
+            ),
+        },
+    },
+}
+
+
+def _apply_visual_style_preset(
+    provider,
+    selector_key,
+    positive_widget_key,
+    negative_widget_key=None,
+):
+    """Apply a style only when the user explicitly changes that provider's preset."""
+    provider_presets = VISUAL_STYLE_PRESETS.get(provider, {})
+    selected_preset = st.session_state.get(
+        localized_widget_key(selector_key),
+        VISUAL_STYLE_MANUAL,
+    )
+
+    if selected_preset == VISUAL_STYLE_MANUAL:
+        return
+
+    preset = provider_presets.get(selected_preset)
+    if not preset:
+        return
+
+    st.session_state[positive_widget_key] = str(
+        preset.get("positive", "") or ""
+    ).strip()
+
+    if negative_widget_key:
+        st.session_state[negative_widget_key] = str(
+            preset.get("negative", "") or ""
+        ).strip()
+
+
 def _saved_ui_number(key, default, minimum, maximum, number_type=float):
     """读取并限幅持久化数值，避免非法配置破坏 Streamlit slider。"""
     try:
@@ -3137,7 +3971,13 @@ def _get_video_cache_stats(max_age_days=None):
     缓存键包含清理天数，因此切换范围只会为每个范围扫描一次；主动刷新或清理
     完成后会显式清空，最多 30 秒的缓存不会影响实际删除时的二次扫描。
     """
-    return cache_manager.get_video_cache_stats(max_age_days=max_age_days)
+    stats = cache_manager.get_video_cache_stats(max_age_days=max_age_days)
+    return (
+        stats.file_count,
+        stats.total_size,
+        stats.oldest_mtime,
+        stats.newest_mtime,
+    )
 
 
 def _render_cache_management_settings(panel):
@@ -3154,15 +3994,20 @@ def _render_cache_management_settings(panel):
         st.caption(tr("Video Cache Directory"))
         st.code(cache_manager.video_cache_dir(), language="text")
 
-        total_stats = _get_video_cache_stats()
+        (
+            total_file_count,
+            total_size,
+            total_oldest_mtime,
+            _,
+        ) = _get_video_cache_stats()
         metric_count, metric_size, metric_oldest = st.columns(3)
-        metric_count.metric(tr("Cache File Count"), total_stats.file_count)
+        metric_count.metric(tr("Cache File Count"), total_file_count)
         metric_size.metric(
-            tr("Cache Total Size"), _format_file_size(total_stats.total_size)
+            tr("Cache Total Size"), _format_file_size(total_size)
         )
         oldest_text = (
-            datetime.fromtimestamp(total_stats.oldest_mtime).strftime("%Y-%m-%d")
-            if total_stats.oldest_mtime is not None
+            datetime.fromtimestamp(total_oldest_mtime).strftime("%Y-%m-%d")
+            if total_oldest_mtime is not None
             else "-"
         )
         metric_oldest.metric(tr("Oldest Cache Date"), oldest_text)
@@ -3181,11 +4026,16 @@ def _render_cache_management_settings(panel):
             format_func=lambda value: cleanup_labels[value],
             key="video_cache_cleanup_range",
         )
-        cleanup_preview = _get_video_cache_stats(max_age_days=max_age_days)
+        (
+            cleanup_file_count,
+            cleanup_total_size,
+            _,
+            _,
+        ) = _get_video_cache_stats(max_age_days=max_age_days)
         st.info(
             tr("Cache Cleanup Preview").format(
-                count=cleanup_preview.file_count,
-                size=_format_file_size(cleanup_preview.total_size),
+                count=cleanup_file_count,
+                size=_format_file_size(cleanup_total_size),
             )
         )
 
@@ -3212,7 +4062,7 @@ def _render_cache_management_settings(panel):
         ):
             webbrowser.open(Path(cache_manager.video_cache_dir()).as_uri())
 
-        cleanup_disabled = not confirmed or cleanup_preview.file_count == 0
+        cleanup_disabled = not confirmed or cleanup_file_count == 0
         if cleanup_col.button(
             tr("Clean Cache Now"),
             key="clean_video_cache_now",
@@ -4375,6 +5225,32 @@ def _render_settings_dialog():
                 with st.expander(
                     tr("ComfyUI Video Advanced Settings"), expanded=False
                 ):
+                    comfyui_video_style_preset = stable_selectbox(
+                        tr("Visual Style Preset"),
+                        options=list(VISUAL_STYLE_PRESETS["comfyui_video"]),
+                        default_value=_saved_ui_choice(
+                            "comfyui_video_style_preset",
+                            list(VISUAL_STYLE_PRESETS["comfyui_video"]),
+                            VISUAL_STYLE_MANUAL,
+                        ),
+                        key="comfyui_video_style_preset_select",
+                        format_func=lambda value: tr(
+                            VISUAL_STYLE_PRESET_LABELS[value]
+                        ),
+                        on_change=_apply_visual_style_preset,
+                        args=(
+                            "comfyui_video",
+                            "comfyui_video_style_preset_select",
+                            "comfyui_video_prompt_template_input",
+                            "comfyui_video_negative_prompt_input",
+                        ),
+                    )
+                    _set_runtime_config(
+                        "ui",
+                        "comfyui_video_style_preset",
+                        comfyui_video_style_preset,
+                    )
+
                     comfyui_video_prompt_template = st.text_area(
                         tr("ComfyUI Video Prompt Template"),
                         value=str(
@@ -4403,7 +5279,7 @@ def _render_settings_dialog():
                             )
                             or ""
                         ),
-                        placeholder="text, watermark, logo, blurry, low quality",
+                        placeholder="blurry, low quality",
                         key="comfyui_video_negative_prompt_input",
                     )
                     _set_runtime_config(
@@ -4483,6 +5359,31 @@ def _render_settings_dialog():
                 with st.expander(
                     tr("OpenAI Image Advanced Settings"), expanded=False
                 ):
+                    openai_image_style_preset = stable_selectbox(
+                        tr("Visual Style Preset"),
+                        options=list(VISUAL_STYLE_PRESETS["openai_image"]),
+                        default_value=_saved_ui_choice(
+                            "openai_image_style_preset",
+                            list(VISUAL_STYLE_PRESETS["openai_image"]),
+                            VISUAL_STYLE_MANUAL,
+                        ),
+                        key="openai_image_style_preset_select",
+                        format_func=lambda value: tr(
+                            VISUAL_STYLE_PRESET_LABELS[value]
+                        ),
+                        on_change=_apply_visual_style_preset,
+                        args=(
+                            "openai_image",
+                            "openai_image_style_preset_select",
+                            "openai_image_prompt_template_input",
+                        ),
+                    )
+                    _set_runtime_config(
+                        "ui",
+                        "openai_image_style_preset",
+                        openai_image_style_preset,
+                    )
+
                     openai_image_size = st.text_input(
                         tr("OpenAI Image Size"),
                         value=str(config.app.get("openai_image_size", "") or ""),
@@ -4499,7 +5400,7 @@ def _render_settings_dialog():
                         value=str(
                             config.app.get("openai_image_prompt_template", "") or ""
                         ),
-                        placeholder="cinematic photo of {term}, photorealistic",
+                        placeholder="{term}",
                         help=tr("OpenAI Image Prompt Template Help"),
                         key="openai_image_prompt_template_input",
                     )
@@ -4560,6 +5461,32 @@ def _render_settings_dialog():
                 with st.expander(
                     tr("ComfyUI T2I Advanced Settings"), expanded=False
                 ):
+                    comfyui_t2i_style_preset = stable_selectbox(
+                        tr("Visual Style Preset"),
+                        options=list(VISUAL_STYLE_PRESETS["comfyui_t2i"]),
+                        default_value=_saved_ui_choice(
+                            "comfyui_t2i_style_preset",
+                            list(VISUAL_STYLE_PRESETS["comfyui_t2i"]),
+                            VISUAL_STYLE_MANUAL,
+                        ),
+                        key="comfyui_t2i_style_preset_select",
+                        format_func=lambda value: tr(
+                            VISUAL_STYLE_PRESET_LABELS[value]
+                        ),
+                        on_change=_apply_visual_style_preset,
+                        args=(
+                            "comfyui_t2i",
+                            "comfyui_t2i_style_preset_select",
+                            "comfyui_t2i_prompt_template_input",
+                            "comfyui_t2i_negative_prompt_input",
+                        ),
+                    )
+                    _set_runtime_config(
+                        "ui",
+                        "comfyui_t2i_style_preset",
+                        comfyui_t2i_style_preset,
+                    )
+
                     comfyui_t2i_prompt_template = st.text_area(
                         tr("ComfyUI T2I Prompt Template"),
                         value=str(
@@ -4588,7 +5515,7 @@ def _render_settings_dialog():
                             )
                             or ""
                         ),
-                        placeholder="text, watermark, logo, blurry, low quality",
+                        placeholder="blurry, low quality",
                         key="comfyui_t2i_negative_prompt_input",
                     )
                     _set_runtime_config(
